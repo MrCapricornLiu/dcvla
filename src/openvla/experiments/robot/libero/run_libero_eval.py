@@ -75,6 +75,8 @@ class GenerateConfig:
     task_suite_name: str = "libero_spatial"          # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     num_steps_wait: int = 10                         # Number of steps to wait for objects to stabilize in sim
     num_trials_per_task: int = 50                    # Number of rollouts per task
+    num_tasks: Optional[int] = None                  # Number of tasks to evaluate from the suite. If None, all tasks are evaluated.
+    task_start_id: int = 0                           # Starting task ID (0-indexed) for evaluation
 
     #################################################################################################################
     # Utils
@@ -144,12 +146,26 @@ def eval_libero(cfg: GenerateConfig) -> None:
     print(f"Task suite: {cfg.task_suite_name}")
     log_file.write(f"Task suite: {cfg.task_suite_name}\n")
 
+    # Determine task range to evaluate
+    task_end_id = cfg.task_start_id + cfg.num_tasks if cfg.num_tasks is not None else num_tasks_in_suite
+    task_end_id = min(task_end_id, num_tasks_in_suite)  # Ensure we don't exceed available tasks
+
+    # Validate task range
+    assert cfg.task_start_id >= 0, f"task_start_id must be >= 0, got {cfg.task_start_id}"
+    assert cfg.task_start_id < num_tasks_in_suite, f"task_start_id ({cfg.task_start_id}) must be < num_tasks_in_suite ({num_tasks_in_suite})"
+    assert task_end_id > cfg.task_start_id, f"No tasks to evaluate! task_start_id={cfg.task_start_id}, task_end_id={task_end_id}"
+
+    print(f"Evaluating tasks {cfg.task_start_id} to {task_end_id-1} (total: {task_end_id - cfg.task_start_id} tasks)")
+    print(f"Each task will be evaluated {cfg.num_trials_per_task} times")
+    log_file.write(f"Evaluating tasks {cfg.task_start_id} to {task_end_id-1} (total: {task_end_id - cfg.task_start_id} tasks)\n")
+    log_file.write(f"Each task will be evaluated {cfg.num_trials_per_task} times\n")
+
     # Get expected image dimensions
     resize_size = get_image_resize_size(cfg)
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+    for task_id in tqdm.tqdm(range(cfg.task_start_id, task_end_id)):
         # Get task
         task = task_suite.get_task(task_id)
 
