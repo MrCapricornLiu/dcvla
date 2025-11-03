@@ -77,12 +77,73 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x):
+    def forward(
+        self,
+        x,
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        reusable_patches: Optional[torch.Tensor] = None,
+        reuse_ratio: float = 1.0,
+        use_cache: bool = False,
+    ):
+        """
+        Forward with optional KV caching support for DCVLA.
+
+        Args:
+            x: Input tensor of shape [B, N, C]
+            past_kv: Tuple of (cached_k, cached_v), each [B, num_heads, N, head_dim]
+            reusable_patches: Boolean tensor [N], True = can reuse cache (controls reuse logic)
+            reuse_ratio: Ratio of reusable_patches to actually reuse (0.0-1.0)
+            use_cache: Whether to return K, V for caching (controls cache storage)
+
+        Returns:
+            x: Output tensor [B, N, C]
+            (k, v): Current K, V for caching (if use_cache=True, else None)
+        """
         B, N, C = x.shape
+
+        # Compute Q, K, V
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
+        q, k, v = qkv.unbind(0)  # Each: [B, num_heads, N, head_dim]
         q, k = self.q_norm(q), self.k_norm(k)
 
+        # === DCVLA: KV Reuse Logic ===
+        # Check if we can reuse cached KV (separate from whether to cache new KV)
+        can_reuse_kv = (past_kv is not None and
+                        past_kv[0] is not None and past_kv[1] is not None and
+                        reusable_patches is not None)
+        if can_reuse_kv:
+            cached_k, cached_v = past_kv
+
+            # Handle case where reusable_patches might not include all tokens (e.g., missing class token)
+            # If reusable_patches.shape[0] < N, assume the first (N - reusable_patches.shape[0]) tokens
+            # are prefix tokens (class token, register tokens) that should always be recomputed
+            num_prefix_tokens = N - reusable_patches.shape[0]
+            if num_prefix_tokens > 0:
+                # Create full mask: prefix tokens are False (recompute), then reusable_patches
+                actual_reuse_mask = torch.cat([
+                    torch.zeros(num_prefix_tokens, dtype=torch.bool, device=x.device),
+                    reusable_patches
+                ])
+            else:
+                actual_reuse_mask = reusable_patches
+
+            # Apply reuse_ratio if needed
+            if reuse_ratio < 1.0:
+                reusable_indices = torch.where(actual_reuse_mask)[0]
+                num_reuse = int(len(reusable_indices) * reuse_ratio)
+                selected_indices = reusable_indices[:num_reuse]
+                actual_reuse_mask = torch.zeros(N, dtype=torch.bool, device=x.device)
+                actual_reuse_mask[selected_indices] = True
+
+            # Selective KV reuse
+            # For patches where actual_reuse_mask=True: use cached K, V
+            # For patches where actual_reuse_mask=False: use newly computed K, V
+            # Query is ALWAYS newly computed (for context awareness)
+            mask_expanded = actual_reuse_mask.view(1, 1, N, 1).expand_as(k)
+            k = torch.where(mask_expanded, cached_k, k)
+            v = torch.where(mask_expanded, cached_v, v)
+
+        # Standard attention computation
         if self.fused_attn:
             x = F.scaled_dot_product_attention(
                 q, k, v,
@@ -98,7 +159,14 @@ class Attention(nn.Module):
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
-        return x
+
+        # Return output and optionally K, V for caching
+        # IMPORTANT: For backward compatibility with TIMM modules (e.g., ResPostBlock),
+        # only return tuple when use_cache=True; otherwise return single tensor
+        if use_cache:
+            return x, (k.detach(), v.detach())
+        else:
+            return x  # Single tensor for backward compatibility
 
 
 class LayerScale(nn.Module):
@@ -152,10 +220,54 @@ class Block(nn.Module):
         self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-    def forward(self, x):
-        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
+    def forward(
+        self,
+        x,
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        reusable_patches: Optional[torch.Tensor] = None,
+        reuse_ratio: float = 1.0,
+        use_cache: bool = False,
+    ):
+        """
+        Forward with optional KV caching support for DCVLA.
+
+        Args:
+            x: Input tensor [B, N, C]
+            past_kv: Cached (K, V) from previous frame
+            reusable_patches: Boolean mask for which patches can reuse cache
+            reuse_ratio: Fraction of reusable patches to actually reuse
+            use_cache: Whether to return K, V for caching
+
+        Returns:
+            x: Output tensor [B, N, C]
+            kv: Current (K, V) for caching (if use_cache=True, else None)
+        """
+        # Attention with caching
+        attn_result = self.attn(
+            self.norm1(x),
+            past_kv=past_kv,
+            reusable_patches=reusable_patches,
+            reuse_ratio=reuse_ratio,
+            use_cache=use_cache,
+        )
+
+        # Handle return value from attention (tuple if caching, tensor if not)
+        if use_cache:
+            attn_out, kv = attn_result
+        else:
+            attn_out = attn_result
+            kv = None
+
+        x = x + self.drop_path1(self.ls1(attn_out))
+
+        # MLP (unchanged)
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
-        return x
+
+        # Return tuple if caching, single tensor otherwise (backward compatibility)
+        if use_cache:
+            return x, kv
+        else:
+            return x
 
 
 class ResPostBlock(nn.Module):
@@ -658,17 +770,79 @@ class VisionTransformer(nn.Module):
             return tuple(zip(outputs, prefix_tokens))
         return tuple(outputs)
 
-    def forward_features(self, x):
+    def forward_features(
+        self,
+        x,
+        vit_cache: Optional['ViTCache'] = None,
+        reusable_patches: Optional[torch.Tensor] = None,
+        layer_reuse_schedule: Optional[torch.Tensor] = None,
+    ):
+        """
+        Forward features with optional KV caching support for DCVLA.
+
+        Args:
+            x: Input tensor [B, C, H, W]
+            vit_cache: ViTCache object from previous frame
+            reusable_patches: [N] boolean mask for cacheable patches
+            layer_reuse_schedule: [depth] tensor of per-layer reuse ratios
+
+        Returns:
+            x: Output features [B, N, C]
+            new_cache: Updated ViTCache, or None if caching not used
+        """
         x = self.patch_embed(x)
         x = self._pos_embed(x)
         x = self.patch_drop(x)
         x = self.norm_pre(x)
+
+        # Initialize new cache if using caching
+        use_cache = vit_cache is not None
+        if use_cache:
+            from .vit_cache_utils import ViTCache
+            new_cache = ViTCache()
+        else:
+            new_cache = None
+
+        # Process through blocks
         if self.grad_checkpointing and not torch.jit.is_scripting():
+            # Gradient checkpointing mode (no caching support for now)
             x = checkpoint_seq(self.blocks, x)
         else:
-            x = self.blocks(x)
+            if use_cache:
+                # Manual iteration with caching enabled
+                for i, block in enumerate(self.blocks):
+                    # Get cached K, V for this block
+                    past_kv = vit_cache.get_kv(i)
+
+                    # Get reuse ratio for this layer
+                    reuse_ratio = 1.0
+                    if layer_reuse_schedule is not None and i < len(layer_reuse_schedule):
+                        reuse_ratio = layer_reuse_schedule[i].item()
+
+                    # Forward block with caching (use_cache=True tells it to return KV)
+                    x, kv = block(
+                        x,
+                        past_kv=past_kv,
+                        reusable_patches=reusable_patches,
+                        reuse_ratio=reuse_ratio,
+                        use_cache=True,  # Always return KV for cache storage
+                    )
+
+                    # Store K, V in cache
+                    if kv is not None:
+                        new_cache.update(kv[0], kv[1], i)
+            else:
+                # Standard forward without caching (use_cache=False, no KV returned)
+                for block in self.blocks:
+                    x_out = block(x, use_cache=False)
+                    # Handle both tuple and tensor returns for backward compatibility
+                    if isinstance(x_out, tuple):
+                        x, _ = x_out
+                    else:
+                        x = x_out
+
         x = self.norm(x)
-        return x
+        return x, new_cache
 
     def forward_head(self, x, pre_logits: bool = False):
         if self.attn_pool is not None:
@@ -681,10 +855,40 @@ class VisionTransformer(nn.Module):
         x = self.head_drop(x)
         return x if pre_logits else self.head(x)
 
-    def forward(self, x):
-        x = self.forward_features(x)
+    def forward(
+        self,
+        x,
+        vit_cache: Optional['ViTCache'] = None,
+        reusable_patches: Optional[torch.Tensor] = None,
+        layer_reuse_schedule: Optional[torch.Tensor] = None,
+        return_cache: bool = False,
+    ):
+        """
+        Forward with optional KV caching support for DCVLA.
+
+        Args:
+            x: Input tensor [B, C, H, W]
+            vit_cache: Cache from previous frame
+            reusable_patches: Patch selection mask
+            layer_reuse_schedule: Per-layer reuse ratios
+            return_cache: If True, return (output, cache); else return output only
+
+        Returns:
+            If return_cache=True: (x, new_cache) where x is [B, num_classes]
+            If return_cache=False: x [B, num_classes]
+        """
+        x, new_cache = self.forward_features(
+            x,
+            vit_cache=vit_cache,
+            reusable_patches=reusable_patches,
+            layer_reuse_schedule=layer_reuse_schedule,
+        )
         x = self.forward_head(x)
-        return x
+
+        if return_cache or vit_cache is not None:
+            return x, new_cache
+        else:
+            return x
 
 
 def init_weights_vit_timm(module: nn.Module, name: str = ''):
