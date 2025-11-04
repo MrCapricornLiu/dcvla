@@ -15,6 +15,7 @@ References [LLaVa, IDEFICS-2]:
 import logging
 from dataclasses import dataclass
 from functools import partial
+from types import MethodType
 from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -82,8 +83,9 @@ class PrismaticVisionBackbone(nn.Module):
             img_size=image_sizes[0],
             act_layer=timm_override_act_layers[0],
         )
-        self.featurizer.forward = unpack_tuple(
-            partial(self.featurizer.get_intermediate_layers, n={len(self.featurizer.blocks) - 2})
+        self._primary_block_idx = len(self.featurizer.blocks) - 2
+        self.featurizer.forward = MethodType(
+            self._build_vit_forward_wrapper(self._primary_block_idx), self.featurizer
         )
         self.embed_dim = self.featurizer.embed_dim
 
@@ -96,8 +98,9 @@ class PrismaticVisionBackbone(nn.Module):
                 img_size=image_sizes[1],
                 act_layer=timm_override_act_layers[1],
             )
-            self.fused_featurizer.forward = unpack_tuple(
-                partial(self.fused_featurizer.get_intermediate_layers, n={len(self.fused_featurizer.blocks) - 2})
+            self._fused_block_idx = len(self.fused_featurizer.blocks) - 2
+            self.fused_featurizer.forward = MethodType(
+                self._build_vit_forward_wrapper(self._fused_block_idx), self.fused_featurizer
             )
             self.embed_dim += self.fused_featurizer.embed_dim
 
@@ -111,16 +114,127 @@ class PrismaticVisionBackbone(nn.Module):
                 if isinstance(module, LayerScale):
                     ls_apply_patch(module)
 
-    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+    def _build_vit_forward_wrapper(self, block_idx: int):
+        def wrapped_forward(
+            module_self: timm.models.vision_transformer.VisionTransformer,
+            pixel_values: torch.Tensor,
+            vit_cache: Optional["ViTCache"] = None,
+            reusable_patches: Optional[torch.Tensor] = None,
+            layer_reuse_schedule: Optional[torch.Tensor] = None,
+            return_cache: bool = False,
+        ):
+            default_forward = unpack_tuple(
+                partial(module_self.get_intermediate_layers, n={block_idx})
+            )
+            use_cache = return_cache or (vit_cache is not None)
+            has_reuse_args = (reusable_patches is not None) or (layer_reuse_schedule is not None)
+            if not use_cache and not has_reuse_args:
+                return default_forward(pixel_values)
+
+            from timm.models.vit_cache_utils import ViTCache
+
+            cache_input = vit_cache if vit_cache is not None else ViTCache()
+            features, new_cache = module_self.forward_features(
+                pixel_values,
+                vit_cache=cache_input,
+                reusable_patches=reusable_patches,
+                layer_reuse_schedule=layer_reuse_schedule,
+            )
+
+            # Remove prefix tokens (e.g., class token) to match original get_intermediate_layers behaviour
+            if module_self.num_prefix_tokens > 0:
+                features = features[:, module_self.num_prefix_tokens :, :]
+
+            if return_cache:
+                return features, new_cache
+
+            return features
+
+        return wrapped_forward
+
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        vit_cache: Optional[Dict[str, "ViTCache"]] = None,
+        reusable_patches: Optional[Union[torch.Tensor, Dict[str, torch.Tensor]]] = None,
+        layer_reuse_schedule: Optional[Union[torch.Tensor, Dict[str, torch.Tensor]]] = None,
+        return_cache: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, "ViTCache"]]]:
         """Run image (`pixel_values`) through featurizer; if channel-stacked, then dispatch and sequence stack."""
+        def _extract(value, key):
+            if value is None:
+                return None
+            if isinstance(value, dict):
+                return value.get(key)
+            return value
+
         if not self.use_fused_vision_backbone:
+            primary_cache = _extract(vit_cache, "primary")
+            primary_mask = _extract(reusable_patches, "primary")
+            primary_schedule = _extract(layer_reuse_schedule, "primary")
+
+            need_cache = return_cache or (primary_cache is not None) or (primary_mask is not None) or (
+                primary_schedule is not None
+            )
+            if need_cache:
+                patches, cache_primary = self.featurizer(
+                    pixel_values,
+                    vit_cache=primary_cache,
+                    reusable_patches=primary_mask,
+                    layer_reuse_schedule=primary_schedule,
+                    return_cache=True,
+                )
+                cache_dict = {"primary": cache_primary}
+                return (patches, cache_dict) if return_cache else patches
+
             return self.featurizer(pixel_values)
 
         # Split `pixel_values :: [bsz, 2 * 3, resolution, resolution]` =>> featurize =>> channel stack
         img, img_fused = torch.split(pixel_values, [3, 3], dim=1)
-        patches, patches_fused = self.featurizer(img), self.fused_featurizer(img_fused)
+        primary_cache = _extract(vit_cache, "primary")
+        fused_cache = _extract(vit_cache, "fused")
+        primary_mask = _extract(reusable_patches, "primary")
+        fused_mask = _extract(reusable_patches, "fused")
+        primary_schedule = _extract(layer_reuse_schedule, "primary")
+        fused_schedule = _extract(layer_reuse_schedule, "fused")
 
-        return torch.cat([patches, patches_fused], dim=2)
+        need_primary_cache = return_cache or (primary_cache is not None) or (primary_mask is not None) or (
+            primary_schedule is not None
+        )
+        need_fused_cache = return_cache or (fused_cache is not None) or (fused_mask is not None) or (
+            fused_schedule is not None
+        )
+
+        if need_primary_cache:
+            patches, cache_primary = self.featurizer(
+                img,
+                vit_cache=primary_cache,
+                reusable_patches=primary_mask,
+                layer_reuse_schedule=primary_schedule,
+                return_cache=True,
+            )
+        else:
+            patches = self.featurizer(img)
+            cache_primary = None
+
+        if need_fused_cache:
+            patches_fused, cache_fused = self.fused_featurizer(
+                img_fused,
+                vit_cache=fused_cache,
+                reusable_patches=fused_mask,
+                layer_reuse_schedule=fused_schedule,
+                return_cache=True,
+            )
+        else:
+            patches_fused = self.fused_featurizer(img_fused)
+            cache_fused = None
+
+        fused_output = torch.cat([patches, patches_fused], dim=2)
+        if return_cache:
+            cache_dict = {"primary": cache_primary, "fused": cache_fused}
+            return fused_output, cache_dict
+
+        return fused_output
 
 
 # === Prismatic Projector (nn.Module) Definitions ===
@@ -251,6 +365,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         )
         self.vocab_size = config.text_config.vocab_size
         self.pad_token_id = config.pad_token_id
+        self._last_vision_cache: Optional[Dict[str, "ViTCache"]] = None
 
         # HF Boilerplate =>> initializes weights via `_init_weights()` and sets gradient checkpointing
         self.post_init()
@@ -294,6 +409,10 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.FloatTensor] = None,
+        vision_cache: Optional[Dict[str, "ViTCache"]] = None,
+        vision_reuse_mask: Optional[Union[torch.Tensor, Dict[str, torch.Tensor]]] = None,
+        vision_layer_reuse: Optional[Union[torch.Tensor, Dict[str, torch.Tensor]]] = None,
+        return_vision_cache: bool = False,
         labels: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -316,6 +435,8 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
 
         # Instantiate Placeholder for Projector Features
         projected_patch_embeddings = None
+        if past_key_values is None:
+            self._last_vision_cache = None
 
         # Note :: We only support forward passes with the following cases:
         #   => Cached Generation :: (input_ids.shape[1] == 1) and (past_key_values is not None)
@@ -364,7 +485,23 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             # assert past_key_values is None, "Unexpected key `past_key_values` provided during language-only forward!"
 
             # Visual Feature Extraction
-            patch_features = self.vision_backbone(pixel_values)
+            should_return_vision_cache = return_vision_cache if past_key_values is None else False
+            vision_backbone_output = self.vision_backbone(
+                pixel_values,
+                vit_cache=vision_cache,
+                reusable_patches=vision_reuse_mask,
+                layer_reuse_schedule=vision_layer_reuse,
+                return_cache=should_return_vision_cache,
+            )
+
+            if should_return_vision_cache:
+                patch_features, new_vision_cache = vision_backbone_output
+                self._last_vision_cache = new_vision_cache
+            else:
+                patch_features = vision_backbone_output
+                if past_key_values is None and return_vision_cache:
+                    # Caller requested vision cache but generation step already has past kv (shouldn't happen)
+                    self._last_vision_cache = None
 
             # Projection Logic =>> Update Attention Mask
             projected_patch_embeddings = self.projector(patch_features)
@@ -481,6 +618,10 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                 "pixel_values": pixel_values,
                 "past_key_values": past_key_values,
                 "use_cache": kwargs.get("use_cache"),
+                "vision_cache": kwargs.get("vision_cache"),
+                "vision_reuse_mask": kwargs.get("vision_reuse_mask"),
+                "vision_layer_reuse": kwargs.get("vision_layer_reuse"),
+                "return_vision_cache": kwargs.get("return_vision_cache", False),
             }
         )
 
@@ -523,7 +664,13 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         max_cache_length = past_key_values._seen_tokens - self.get_action_dim(unnorm_key) + 1
         past_key_values.crop(max_length=max_cache_length)
         
-        last_caches = {"past_key_values": past_key_values, "attentions": attentions[0]}
+        vision_cache = getattr(self, "_last_vision_cache", None)
+        last_caches = {
+            "past_key_values": past_key_values,
+            "attentions": attentions[0],
+            "vision_cache": vision_cache,
+        }
+        self._last_vision_cache = None
         generated_ids = results.sequences
 
         # Extract predicted action tokens and translate into (normalized) continuous actions

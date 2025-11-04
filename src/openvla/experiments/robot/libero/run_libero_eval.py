@@ -58,7 +58,9 @@ class GenerateConfig:
 
     # Use VLA-Cache for faster inference
     use_vla_cache: bool = True
-    
+    use_vit_cache: bool = True                         # Enable ViT-side cache reuse
+    vit_keyframe_interval: int = 3                     # Force full recompute every N frames
+
     #################################################################################################################
     # Model-specific parameters
     #################################################################################################################

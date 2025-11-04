@@ -377,8 +377,21 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
     prev_image = Image.fromarray(obs["prev_image"])
     prompt_cache = last_caches['past_key_values'] if last_caches is not None else None
     prev_attn = last_caches['attentions'] if last_caches is not None else None
+    want_vit_cache = cfg.use_vla_cache and cfg.use_vit_cache
+    vision_cache = last_caches.get('vision_cache') if (last_caches is not None and want_vit_cache) else None
+    prev_frame_idx = last_caches.get('frame_idx', -1) if last_caches is not None else -1
+    frame_idx = prev_frame_idx + 1
+    is_keyframe = want_vit_cache and (frame_idx % cfg.vit_keyframe_interval == 0)
     mask_indices = None
     vla.language_model.config.proportion_attn_var = None
+    vision_reuse_mask = None
+    
+    if vision_cache is not None:
+        # Ensure cached tensors reside on the current device
+        vision_cache = {
+            key: cache.to(DEVICE) if cache is not None else None
+            for key, cache in vision_cache.items()
+        }
 
 
     # (If trained with image augmentations) Center crop image and then resize back up to original size.
@@ -388,7 +401,13 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
         image = process_image(image)
         prev_image = process_image(prev_image)
 
-    if cfg.use_vla_cache:
+    if is_keyframe:
+        # Full recompute for ViT; drop only vision caches
+        vision_cache = None
+        vision_reuse_mask = None
+        mask_indices = None
+
+    if cfg.use_vla_cache and (not is_keyframe):
         print(">> VLA-Cache inference mode")
         # Step 1: Identify visually stable patches across frames
         if prompt_cache is not None:
@@ -405,11 +424,22 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
 
             vla.language_model.config.reusable_patches = mask_indices
             vla.language_model.config.proportion_attn_var = get_layer_mask_schedule(prev_attn)
+            if want_vit_cache and mask_indices is not None and mask_indices.numel() > 0:
+                # Convert token indices (1-based vision tokens) to ViT patch mask
+                num_patches = 256  # OpenVLA ViTs operate on 16x16 grids
+                patch_indices = (mask_indices - 1).long()
+                patch_indices = patch_indices[(patch_indices >= 0) & (patch_indices < num_patches)]
+                if patch_indices.numel() > 0:
+                    vision_reuse_mask = torch.zeros(num_patches, dtype=torch.bool, device=DEVICE)
+                    vision_reuse_mask[patch_indices] = True
 
     else:
         print(">> VLA-Cache disabled")
         prompt_cache = None
         mask_indices = None
+        vision_cache = None
+        vision_reuse_mask = None
+        want_vit_cache = False
 
     if prompt_cache is None:
         prompt_cache = DynamicCache()
@@ -426,8 +456,27 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
     inputs = processor(prompt, image).to(DEVICE, dtype=torch.bfloat16)
 
     # Get action.
-    action, last_caches = vla.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=False, return_dict_in_generate=True, 
-                                                        output_attentions = True, past_key_values=prompt_cache)
+    vision_kwargs = {}
+    if want_vit_cache:
+        vision_kwargs["vision_cache"] = vision_cache
+        vision_kwargs["return_vision_cache"] = True
+        if vision_reuse_mask is not None:
+            vision_kwargs["vision_reuse_mask"] = vision_reuse_mask
+
+
+    if want_vit_cache:
+        reuse_ratio = float(vision_reuse_mask.float().mean()) if vision_reuse_mask is not None else 0.0
+        print(f'[ViT Cache] frame={frame_idx} reuse_ratio={reuse_ratio:.3f}')
+    action, last_caches = vla.predict_action(
+        **inputs,
+        unnorm_key=unnorm_key,
+        do_sample=False,
+        return_dict_in_generate=True,
+        output_attentions=True,
+        past_key_values=prompt_cache,
+        **vision_kwargs,
+    )
+    last_caches['frame_idx'] = frame_idx
    
     result_image = np.array(result_image)
     return action, last_caches, result_image
