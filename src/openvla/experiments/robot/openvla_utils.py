@@ -174,13 +174,16 @@ def check_model_logic_mismatch(pretrained_checkpoint: str) -> None:
     if not os.path.isdir(pretrained_checkpoint):
         return
 
-    # Find current files
+    # Find current files (paths relative to repository when script executed anywhere)
     curr_files = {"modeling_prismatic.py": None, "configuration_prismatic.py": None}
+    prismatic_root = Path(__file__).resolve().parents[2] / "prismatic"
 
-    for root, _, files in os.walk("./prismatic/"):
-        for filename in curr_files.keys():
-            if filename in files and curr_files[filename] is None:
-                curr_files[filename] = os.path.join(root, filename)
+    for filename in curr_files.keys():
+        try:
+            match = next(prismatic_root.rglob(filename))
+        except StopIteration:
+            match = None
+        curr_files[filename] = str(match) if match is not None else None
 
     # Check and handle each file
     for filename, curr_filepath in curr_files.items():
@@ -380,6 +383,7 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
     mask_indices = None
     vla.language_model.config.proportion_attn_var = None
 
+    want_vit_cache = cfg.use_vla_cache and getattr(cfg, "use_vit_cache", True)
 
     # (If trained with image augmentations) Center crop image and then resize back up to original size.
     # IMPORTANT: Let's say crop scale == 0.9. To get the new height and width (post-crop), multiply
@@ -387,6 +391,11 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
     if center_crop:
         image = process_image(image)
         prev_image = process_image(prev_image)
+
+    if last_caches is None or not want_vit_cache:
+        vla.vision_backbone.reset_cache()
+
+    vision_mask = None
 
     if cfg.use_vla_cache:
         print(">> VLA-Cache inference mode")
@@ -406,14 +415,29 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
             vla.language_model.config.reusable_patches = mask_indices
             vla.language_model.config.proportion_attn_var = get_layer_mask_schedule(prev_attn)
 
+            if want_vit_cache and mask_indices is not None and mask_indices.numel() > 0:
+                # Convert 1-indexed token ids (vision tokens start at 1) to 0-indexed patch mask
+                zero_indexed = (mask_indices.long() - 1).cpu()
+                zero_indexed = zero_indexed[(zero_indexed >= 0) & (zero_indexed < 256)]
+                if zero_indexed.numel() > 0:
+                    vision_mask = torch.zeros(256, dtype=torch.bool)
+                    vision_mask[zero_indexed] = True
+
     else:
         print(">> VLA-Cache disabled")
         prompt_cache = None
         mask_indices = None
+        vla.vision_backbone.reset_cache()
+        vision_mask = None
 
     if prompt_cache is None:
         prompt_cache = DynamicCache()
-        
+
+    if want_vit_cache:
+        vla.vision_backbone.set_reuse_mask(vision_mask)
+    else:
+        vla.vision_backbone.set_reuse_mask(None)
+
     # Build VLA prompt
     if "openvla-v01" in base_vla_name:  # OpenVLA v0.1
         prompt = (
@@ -428,6 +452,9 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
     # Get action.
     action, last_caches = vla.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=False, return_dict_in_generate=True, 
                                                         output_attentions = True, past_key_values=prompt_cache)
+    if vision_mask is not None:
+        reuse_ratio = vision_mask.float().mean().item()
+        print(f"[ViT Cache] frame reuse_ratio={reuse_ratio:.3f}")
    
     result_image = np.array(result_image)
     return action, last_caches, result_image

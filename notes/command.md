@@ -7,7 +7,18 @@ CUDA_VISIBLE_DEVICES=0 python experiments/robot/libero/run_libero_eval.py \
   --num_trials_per_task 1 \
   --num_tasks 1 \
   --task_start_id 0 \
-  --use_vla_cache False
+  --use_vla_cache True \
+  --use_vit_cache True
+
+CUDA_VISIBLE_DEVICES=2 python experiments/robot/libero/run_libero_eval.py \
+  --pretrained_checkpoint checkpoints/openvla-7b-finetuned-libero-spatial \
+  --task_suite_name libero_spatial \
+  --num_trials_per_task 50 \
+  --num_tasks 1 \
+  --use_vla_cache True \
+  --use_vit_cache True \
+  --local_log_dir "/home/lch/Documents/dcvla/results/vit_cache_ttf_test"  \
+  --task_start_id 10 > "/home/lch/Documents/dcvla/results/vit_cache_ttf_test/output10.log" 2>&1 &
 ```
 
 
