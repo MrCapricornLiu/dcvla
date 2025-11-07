@@ -20,7 +20,12 @@ from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 
-from .vla_cache_utils import find_static_patches, task_relevant_selection, get_layer_mask_schedule
+from .vla_cache_utils import (
+    find_static_patches,
+    task_relevant_selection,
+    get_layer_mask_schedule,
+    build_vision_cache_schedule,
+)
 
 from transformers import DynamicCache
 
@@ -381,9 +386,11 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
     prompt_cache = last_caches['past_key_values'] if last_caches is not None else None
     prev_attn = last_caches['attentions'] if last_caches is not None else None
     mask_indices = None
+    vision_schedule = None
     vla.language_model.config.proportion_attn_var = None
 
     want_vit_cache = cfg.use_vla_cache and getattr(cfg, "use_vit_cache", True)
+    reuse_vit_q = getattr(cfg, "reuse_vit_q", False)
 
     # (If trained with image augmentations) Center crop image and then resize back up to original size.
     # IMPORTANT: Let's say crop scale == 0.9. To get the new height and width (post-crop), multiply
@@ -422,6 +429,11 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
                 if zero_indexed.numel() > 0:
                     vision_mask = torch.zeros(256, dtype=torch.bool)
                     vision_mask[zero_indexed] = True
+                    num_vit_layers = len(vla.vision_backbone.featurizer.blocks)
+                    vision_schedule = build_vision_cache_schedule(
+                        prev_attn,
+                        num_vit_layers,
+                    )
 
     else:
         print(">> VLA-Cache disabled")
@@ -429,14 +441,15 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
         mask_indices = None
         vla.vision_backbone.reset_cache()
         vision_mask = None
+        vision_schedule = None
 
     if prompt_cache is None:
         prompt_cache = DynamicCache()
 
     if want_vit_cache:
-        vla.vision_backbone.set_reuse_mask(vision_mask)
+        vla.vision_backbone.set_reuse_spec(vision_mask, vision_schedule, reuse_q=reuse_vit_q)
     else:
-        vla.vision_backbone.set_reuse_mask(None)
+        vla.vision_backbone.set_reuse_spec(None, None)
 
     # Build VLA prompt
     if "openvla-v01" in base_vla_name:  # OpenVLA v0.1

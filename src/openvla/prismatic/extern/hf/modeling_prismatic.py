@@ -113,14 +113,22 @@ class PrismaticVisionBackbone(nn.Module):
 
         # Runtime caches for frame-to-frame reuse
         self._reuse_mask: Optional[torch.Tensor] = None
+        self._reuse_schedule: Optional[torch.Tensor] = None
+        self._reuse_q: bool = False
         self._cached_primary: Optional[torch.Tensor] = None
         self._cached_fused: Optional[torch.Tensor] = None
+        self._supports_native_reuse_primary = hasattr(self.featurizer, "set_patch_reuse_spec")
+        self._supports_native_reuse_fused = (
+            self.use_fused_vision_backbone
+            and hasattr(self.fused_featurizer, "set_patch_reuse_spec")
+        )
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """Run image (`pixel_values`) through featurizer; if channel-stacked, then dispatch and sequence stack."""
         if not self.use_fused_vision_backbone:
             patches = self.featurizer(pixel_values)
-            patches = self._apply_cached_patches(patches, is_fused=False)
+            if not self._supports_native_reuse_primary:
+                patches = self._apply_cached_patches(patches, is_fused=False)
             self._cached_primary = patches.detach().clone()
             self._cached_fused = None
             return patches
@@ -130,8 +138,10 @@ class PrismaticVisionBackbone(nn.Module):
         patches = self.featurizer(img)
         patches_fused = self.fused_featurizer(img_fused)
 
-        patches = self._apply_cached_patches(patches, is_fused=False)
-        patches_fused = self._apply_cached_patches(patches_fused, is_fused=True)
+        if not self._supports_native_reuse_primary:
+            patches = self._apply_cached_patches(patches, is_fused=False)
+        if not self._supports_native_reuse_fused:
+            patches_fused = self._apply_cached_patches(patches_fused, is_fused=True)
 
         self._cached_primary = patches.detach().clone()
         self._cached_fused = patches_fused.detach().clone()
@@ -139,18 +149,42 @@ class PrismaticVisionBackbone(nn.Module):
         return torch.cat([patches, patches_fused], dim=2)
 
     def set_reuse_mask(self, mask: Optional[torch.Tensor]) -> None:
-        """Register a boolean mask (num_patches,) indicating which patches reuse cached features."""
+        self.set_reuse_spec(mask, self._reuse_schedule, reuse_q=self._reuse_q)
+
+    def set_reuse_spec(
+        self,
+        mask: Optional[torch.Tensor],
+        schedule: Optional[torch.Tensor],
+        *,
+        reuse_q: bool = False,
+    ) -> None:
+        """Register a patch reuse specification shared with the TIMM backbone."""
+        self._reuse_q = reuse_q
         if mask is None:
             self._reuse_mask = None
-            return
-        if mask.dtype != torch.bool:
-            mask = mask.to(torch.bool)
-        self._reuse_mask = mask.detach().cpu()
+        else:
+            if mask.dtype != torch.bool:
+                mask = mask.to(torch.bool)
+            self._reuse_mask = mask.detach().cpu()
+
+        if schedule is None:
+            self._reuse_schedule = None
+        else:
+            self._reuse_schedule = schedule.detach().cpu().to(torch.float32)
+
+        if self._supports_native_reuse_primary:
+            self.featurizer.set_patch_reuse_spec(self._reuse_mask, self._reuse_schedule, reuse_q=reuse_q)
+        if self._supports_native_reuse_fused:
+            self.fused_featurizer.set_patch_reuse_spec(self._reuse_mask, self._reuse_schedule, reuse_q=reuse_q)
 
     def reset_cache(self) -> None:
         """Clear stored patch tokens."""
         self._cached_primary = None
         self._cached_fused = None
+        if self._supports_native_reuse_primary and hasattr(self.featurizer, "reset_patch_reuse"):
+            self.featurizer.reset_patch_reuse()
+        if self._supports_native_reuse_fused and hasattr(self.fused_featurizer, "reset_patch_reuse"):
+            self.fused_featurizer.reset_patch_reuse()
 
     def _apply_cached_patches(self, patches: torch.Tensor, *, is_fused: bool) -> torch.Tensor:
         """Replace cached patch tokens according to the reuse mask (if available)."""

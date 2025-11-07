@@ -43,6 +43,34 @@ def get_layer_mask_schedule(multihead_attention, apply_weighted_growth=True, gro
 
     return reuse
 
+
+def build_vision_cache_schedule(multihead_attention, num_vit_layers, apply_weighted_growth=True, growth_factor=0.55):
+    """Resample the language-model reuse schedule to match ViT depth."""
+    if num_vit_layers <= 0:
+        return None
+
+    base_schedule = get_layer_mask_schedule(
+        multihead_attention,
+        apply_weighted_growth=apply_weighted_growth,
+        growth_factor=growth_factor,
+    )
+
+    if base_schedule.numel() == 0:
+        return torch.zeros(num_vit_layers, dtype=torch.float32, device=base_schedule.device)
+
+    if base_schedule.numel() == num_vit_layers:
+        schedule = base_schedule
+    else:
+        base_cpu = base_schedule.detach().cpu().float().numpy()
+        x_src = np.linspace(0.0, 1.0, num=base_cpu.shape[0])
+        x_tgt = np.linspace(0.0, 1.0, num=num_vit_layers)
+        resampled = np.interp(x_tgt, x_src, base_cpu)
+        resampled = np.maximum.accumulate(resampled)
+        schedule = torch.from_numpy(resampled).to(base_schedule.device)
+
+    schedule = torch.clamp(schedule, 0.0, 1.0)
+    return schedule
+
 def patchify(image, patch_size=14):
     """
     Converts an image into non-overlapping patches.

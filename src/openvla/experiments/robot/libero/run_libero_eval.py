@@ -59,6 +59,7 @@ class GenerateConfig:
     # Use VLA-Cache for faster inference
     use_vla_cache: bool = True
     use_vit_cache: bool = True                     # Whether to reuse vision encoder tokens across frames
+    reuse_vit_q: bool = False                      # If True, also reuse ViT query states for static patches
     
     #################################################################################################################
     # Model-specific parameters
