@@ -26,8 +26,11 @@ Hacked together by / Copyright 2020, Ross Wightman
 import logging
 import math
 from collections import OrderedDict
+from dataclasses import dataclass
 from functools import partial
 from typing import Callable, List, Optional, Sequence, Tuple, Type, Union
+
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -48,6 +51,117 @@ __all__ = ['VisionTransformer']  # model_registry will add each entrypoint fn to
 
 
 _logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _PatchReuseContext:
+    keep_mask: Optional[torch.Tensor]
+    static_mask: torch.Tensor
+    cached: Optional[torch.Tensor]
+
+
+
+class _PatchReuseManager:
+    def __init__(self, layer_masks: List[Optional[torch.Tensor]], reuse_q: bool, num_patches: int):
+        self.layer_masks = layer_masks
+        self.reuse_q = reuse_q
+        self.num_patches = num_patches
+        self.cached_layers: List[Optional[torch.Tensor]] = [None] * len(layer_masks)
+        self.ready: bool = False
+
+    def reset(self) -> None:
+        self.cached_layers = [None] * len(self.layer_masks)
+        self.ready = False
+
+    def pre_block(
+        self,
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        num_prefix_tokens: int,
+    ) -> Tuple[torch.Tensor, Optional[_PatchReuseContext]]:
+        mask = self.layer_masks[layer_idx]
+        if mask is None or not mask.any():
+            return hidden_states, None
+        if not self.ready:
+            return hidden_states, None
+        cached = self.cached_layers[layer_idx]
+        if cached is None:
+            return hidden_states, None
+        static_mask = self._expand_mask(mask, hidden_states, num_prefix_tokens)
+        if self.reuse_q:
+            return hidden_states, _PatchReuseContext(None, static_mask, cached)
+        keep_mask = ~static_mask
+        reduced = hidden_states[:, keep_mask, :]
+        return reduced, _PatchReuseContext(keep_mask, static_mask, cached)
+
+    def post_block(
+        self,
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        context: Optional[_PatchReuseContext],
+        num_prefix_tokens: int,
+    ) -> torch.Tensor:
+        mask = self.layer_masks[layer_idx]
+        if mask is None or not mask.any():
+            return hidden_states
+
+        if context is None:
+            self._record_layer(layer_idx, hidden_states, num_prefix_tokens)
+            return hidden_states
+
+        keep_mask, static_mask, cached = context.keep_mask, context.static_mask, context.cached
+        cached = cached.to(hidden_states.device, dtype=hidden_states.dtype)
+
+        if keep_mask is None:
+            output = hidden_states.clone()
+            output[:, static_mask, :] = cached
+        else:
+            seq_len = static_mask.size(0)
+            output = hidden_states.new_empty(hidden_states.shape[0], seq_len, hidden_states.shape[2])
+            output[:, keep_mask, :] = hidden_states
+            output[:, static_mask, :] = cached
+
+        if not self.ready:
+            self._record_layer(layer_idx, output, num_prefix_tokens)
+        return output
+
+    def finish_frame(self) -> None:
+        if self.ready:
+            return
+        ready = True
+        for mask, cache in zip(self.layer_masks, self.cached_layers):
+            if mask is None or not mask.any():
+                continue
+            if cache is None:
+                ready = False
+                break
+        self.ready = ready
+
+    def _expand_mask(
+        self,
+        patch_mask: torch.Tensor,
+        hidden_states: torch.Tensor,
+        num_prefix_tokens: int,
+    ) -> torch.Tensor:
+        seq_len = hidden_states.shape[1]
+        device = hidden_states.device
+        static_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
+        start = num_prefix_tokens
+        end = start + patch_mask.shape[0]
+        static_mask[start:end] = patch_mask.to(device)
+        return static_mask
+
+    def _record_layer(self, layer_idx: int, hidden_states: torch.Tensor, num_prefix_tokens: int) -> None:
+        if self.ready:
+            return
+        mask = self.layer_masks[layer_idx]
+        if mask is None or not mask.any():
+            return
+        start = num_prefix_tokens
+        end = start + mask.numel()
+        patches = hidden_states[:, start:end, :]
+        selected = patches[:, mask.to(hidden_states.device), :].detach().clone()
+        self.cached_layers[layer_idx] = selected
 
 
 class Attention(nn.Module):
@@ -464,6 +578,7 @@ class VisionTransformer(nn.Module):
         self.no_embed_class = no_embed_class  # don't embed prefix positions (includes reg)
         self.dynamic_img_size = dynamic_img_size
         self.grad_checkpointing = False
+        self._patch_reuse: Optional[_PatchReuseManager] = None
 
         embed_args = {}
         if dynamic_img_size:
@@ -614,18 +729,15 @@ class VisionTransformer(nn.Module):
             x: torch.Tensor,
             n: Union[int, Sequence] = 1,
     ):
-        outputs, num_blocks = [], len(self.blocks)
+        outputs = []
+        num_blocks = len(self.blocks)
         take_indices = set(range(num_blocks - n, num_blocks) if isinstance(n, int) else n)
 
-        # forward pass
         x = self.patch_embed(x)
         x = self._pos_embed(x)
         x = self.patch_drop(x)
         x = self.norm_pre(x)
-        for i, blk in enumerate(self.blocks):
-            x = blk(x)
-            if i in take_indices:
-                outputs.append(x)
+        _, outputs, _ = self._run_blocks_with_reuse(x, take_indices, profile=True)
 
         return outputs
 
@@ -663,12 +775,106 @@ class VisionTransformer(nn.Module):
         x = self._pos_embed(x)
         x = self.patch_drop(x)
         x = self.norm_pre(x)
-        if self.grad_checkpointing and not torch.jit.is_scripting():
+
+        use_checkpoint = self.grad_checkpointing and self._patch_reuse is None and not torch.jit.is_scripting()
+
+        if use_checkpoint:
             x = checkpoint_seq(self.blocks, x)
         else:
-            x = self.blocks(x)
+            x, _ = self._run_blocks_with_reuse(x)
+
         x = self.norm(x)
         return x
+
+    def _run_blocks_with_reuse(
+            self,
+            x: torch.Tensor,
+            take_indices: Optional[set] = None,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        outputs: List[torch.Tensor] = []
+        manager = self._patch_reuse
+        for i, blk in enumerate(self.blocks):
+            context = None
+            if manager is not None:
+                x, context = manager.pre_block(i, x, self.num_prefix_tokens)
+            x = blk(x)
+            if manager is not None:
+                x = manager.post_block(i, x, context, self.num_prefix_tokens)
+            if take_indices is not None and i in take_indices:
+                outputs.append(x)
+        if manager is not None:
+            manager.finish_frame()
+        return x, outputs
+
+    def set_patch_reuse_spec(
+            self,
+            mask: Optional[torch.Tensor],
+            schedule: Optional[torch.Tensor] = None,
+            *,
+            reuse_q: bool = False,
+    ) -> None:
+        if mask is None:
+            self._patch_reuse = None
+            return
+
+        mask = mask.to(torch.bool).detach().cpu()
+        if mask.numel() == 0 or not mask.any():
+            self._patch_reuse = None
+            return
+
+        depth = len(self.blocks)
+        schedule_tensor = self._normalize_schedule(schedule, depth)
+        layer_masks = self._build_layer_masks(mask, schedule_tensor)
+        if all(layer_mask is None for layer_mask in layer_masks):
+            self._patch_reuse = None
+            return
+
+        self._patch_reuse = _PatchReuseManager(layer_masks, reuse_q=reuse_q, num_patches=mask.numel())
+
+    def reset_patch_reuse(self) -> None:
+        self._patch_reuse = None
+
+    def _normalize_schedule(self, schedule: Optional[torch.Tensor], depth: int) -> torch.Tensor:
+        if schedule is None:
+            return torch.ones(depth, dtype=torch.float32)
+        schedule = schedule.detach().cpu().to(torch.float32)
+        if schedule.numel() == depth:
+            return torch.clamp(schedule, 0.0, 1.0)
+        src = schedule.numpy()
+        x_src = np.linspace(0.0, 1.0, num=src.shape[0])
+        x_tgt = np.linspace(0.0, 1.0, num=depth)
+        resampled = np.interp(x_tgt, x_src, src)
+        resampled = np.clip(resampled, 0.0, 1.0)
+        resampled = np.maximum.accumulate(resampled)
+        return torch.from_numpy(resampled.astype(np.float32))
+
+    def _build_layer_masks(
+            self,
+            base_mask: torch.Tensor,
+            schedule: torch.Tensor,
+    ) -> List[Optional[torch.Tensor]]:
+        static_indices = torch.nonzero(base_mask, as_tuple=False).flatten()
+        total_static = static_indices.numel()
+        if total_static == 0:
+            return [None] * len(self.blocks)
+
+        schedule = torch.clamp(schedule, 0.0, 1.0)
+        counts = torch.round(schedule * total_static).to(torch.long)
+        counts = torch.clamp(counts, 0, total_static)
+        counts_list = counts.tolist()
+        for i in range(1, len(counts_list)):
+            if counts_list[i] < counts_list[i - 1]:
+                counts_list[i] = counts_list[i - 1]
+
+        layer_masks: List[Optional[torch.Tensor]] = []
+        for count in counts_list:
+            if count <= 0:
+                layer_masks.append(None)
+                continue
+            layer_mask = torch.zeros_like(base_mask, dtype=torch.bool)
+            layer_mask[static_indices[:count]] = True
+            layer_masks.append(layer_mask)
+        return layer_masks
 
     def forward_head(self, x, pre_logits: bool = False):
         if self.attn_pool is not None:
