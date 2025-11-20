@@ -48,6 +48,7 @@ __all__ = ['VisionTransformer']  # model_registry will add each entrypoint fn to
 
 
 _logger = logging.getLogger(__name__)
+_time_vit = True  # profiling enabled by default
 
 
 class Attention(nn.Module):
@@ -527,6 +528,11 @@ class VisionTransformer(nn.Module):
         self.head_drop = nn.Dropout(drop_rate)
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
+        self._vla_time_enabled = _time_vit
+        self._vla_total_cuda_time = 0.0
+        self._vla_num_forward = 0
+        self._vla_total_flops = 0.0
+        self._vla_last_flops = 0.0
         if weight_init != 'skip':
             self.init_weights(weight_init)
 
@@ -615,6 +621,7 @@ class VisionTransformer(nn.Module):
             n: Union[int, Sequence] = 1,
     ):
         outputs, num_blocks = [], len(self.blocks)
+        flops_total = 0.0
         take_indices = set(range(num_blocks - n, num_blocks) if isinstance(n, int) else n)
 
         # forward pass
@@ -626,6 +633,17 @@ class VisionTransformer(nn.Module):
             x = blk(x)
             if i in take_indices:
                 outputs.append(x)
+            # FLOPs estimation (attention + MLP) for monitoring
+            try:
+                n_tok = x.shape[1]
+                d = x.shape[2]
+                m = getattr(blk.mlp, "fc1").out_features if hasattr(blk.mlp, "fc1") else d * 4
+                flops_block = 4 * n_tok * (d ** 2) + 2 * (n_tok ** 2) * d + 3 * n_tok * d * m
+                flops_total += flops_block
+            except Exception:
+                pass
+
+        self._vla_last_flops = flops_total
 
         return outputs
 
@@ -640,6 +658,13 @@ class VisionTransformer(nn.Module):
         """ Intermediate layer accessor (NOTE: This is a WIP experiment).
         Inspired by DINO / DINOv2 interface
         """
+        timing = self._vla_time_enabled and x.device.type == "cuda"
+        if timing:
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize()
+            start_event.record()
+
         # take last n blocks if n is an int, if in is a sequence, select by matching indices
         outputs = self._intermediate_layers(x, n)
         if norm:
