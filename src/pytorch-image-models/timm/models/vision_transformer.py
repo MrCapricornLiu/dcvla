@@ -26,6 +26,7 @@ Hacked together by / Copyright 2020, Ross Wightman
 import logging
 import math
 import os
+import time
 import weakref
 from collections import OrderedDict
 from functools import partial
@@ -754,6 +755,7 @@ class VisionTransformer(nn.Module):
 
         self._vla_time_enabled = _time_vit
         self._vla_total_cuda_time = 0.0
+        self._vla_total_wall_time = 0.0
         self._vla_num_forward = 0
         self._vla_total_flops = 0.0
         self._vla_last_flops = 0.0
@@ -927,6 +929,7 @@ class VisionTransformer(nn.Module):
         if timing:
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
+            wall_start = time.time()
             torch.cuda.synchronize()
             start_event.record()
 
@@ -952,15 +955,18 @@ class VisionTransformer(nn.Module):
             end_event.record()
             torch.cuda.synchronize()
             elapsed_ms = start_event.elapsed_time(end_event)
+            wall_ms = (time.time() - wall_start) * 1000.0
             self._vla_num_forward += 1
             if self._vla_num_forward > self._vla_profile_warmup:
                 self._vla_total_flops += getattr(self, "_vla_last_flops", 0.0)
                 self._vla_total_cuda_time += elapsed_ms
+                self._vla_total_wall_time += wall_ms
                 eff_steps = max(1, self._vla_num_forward - self._vla_profile_warmup)
                 avg_ms = self._vla_total_cuda_time / eff_steps
+                avg_wall = self._vla_total_wall_time / eff_steps
                 avg_tflops = (self._vla_total_flops / eff_steps) * 1e-12
                 if self._vla_profile_print and (self._vla_profile_interval <= 0 or (eff_steps % self._vla_profile_interval == 0)):
-                    print(f"[ViT Profile] Current CUDA latency: {elapsed_ms:.6f} ms | Average CUDA latency: {avg_ms:.6f} ms, Average TFLOPs: {avg_tflops:.6f}")
+                    print(f"[ViT Profile] Current CUDA latency: {elapsed_ms:.6f} ms (wall {wall_ms:.6f} ms) | Average CUDA latency: {avg_ms:.6f} ms, Average wall: {avg_wall:.6f} ms, Average TFLOPs: {avg_tflops:.6f}")
 
         return result
 
