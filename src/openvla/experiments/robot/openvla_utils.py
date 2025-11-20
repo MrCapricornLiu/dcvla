@@ -437,6 +437,10 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
                 reuse_mask_local[num_prefix + valid_idx] = True
             cache_state = cache_payload if cache_payload is not None else [None] * len(featurizer.blocks)
             featurizer.set_vla_cache_state(cache_state, reuse_mask_local)
+            static_count = reuse_mask_local.sum().item()
+            total_count = reuse_mask_local.numel()
+            ratio = static_count / max(1, total_count)
+            print(f"[ViT Reuse] static={static_count}/{total_count} ({ratio:.3f})")
             if DEBUG_VIT:
                 print(f"[ViT-Setup] mask_len={reuse_mask_local.numel()} static={reuse_mask_local.sum().item()} num_prefix={num_prefix} num_patches={num_patches}")
             return reuse_mask_local

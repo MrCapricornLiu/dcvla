@@ -51,7 +51,7 @@ __all__ = ['VisionTransformer']  # model_registry will add each entrypoint fn to
 
 _logger = logging.getLogger(__name__)
 _debug_vit = os.environ.get("VLA_VIT_DEBUG", "0") == "1"
-_time_vit = True  # profiling enabled by default
+_time_vit = True  # always profile unless explicitly disabled in code
 
 
 class VitBlockCache:
@@ -702,6 +702,10 @@ class VisionTransformer(nn.Module):
         self._vla_num_forward = 0
         self._vla_total_flops = 0.0
         self._vla_last_flops = 0.0
+        self._vla_profile_warmup = int(os.environ.get("VLA_VIT_PROFILE_WARMUP", 0))
+        # Print every call by default; override via env if needed
+        self._vla_profile_interval = int(os.environ.get("VLA_VIT_PROFILE_INTERVAL", 1))
+        self._vla_profile_print = os.environ.get("VLA_VIT_PROFILE_PRINT", "1") == "1"
 
         for idx, blk in enumerate(self.blocks):
             blk._vla_parent_ref = weakref.ref(self)
@@ -815,6 +819,10 @@ class VisionTransformer(nn.Module):
         flops_total = 0.0
         take_indices = set(range(num_blocks - n, num_blocks) if isinstance(n, int) else n)
 
+        # Estimate static tokens (if provided) to approximate saved K/V projections
+        reuse_mask = getattr(self, "_vla_reuse_mask", None)
+        static_tokens = reuse_mask.sum().item() if reuse_mask is not None else 0
+
         # forward pass
         x = self.patch_embed(x)
         x = self._pos_embed(x)
@@ -829,7 +837,9 @@ class VisionTransformer(nn.Module):
                 n_tok = x.shape[1]
                 d = x.shape[2]
                 m = getattr(blk.mlp, "fc1").out_features if hasattr(blk.mlp, "fc1") else d * 4
-                flops_block = 4 * n_tok * (d ** 2) + 2 * (n_tok ** 2) * d + 3 * n_tok * d * m
+                base_flops = 4 * n_tok * (d ** 2) + 2 * (n_tok ** 2) * d + 3 * n_tok * d * m
+                saved_flops = 2 * static_tokens * (d ** 2)  # skip K/V projection for static tokens
+                flops_block = max(base_flops - saved_flops, 0)
                 flops_total += flops_block
             except Exception:
                 pass
@@ -878,12 +888,15 @@ class VisionTransformer(nn.Module):
             end_event.record()
             torch.cuda.synchronize()
             elapsed_ms = start_event.elapsed_time(end_event)
-            self._vla_total_cuda_time += elapsed_ms
-            self._vla_num_forward += 1
             self._vla_total_flops += getattr(self, "_vla_last_flops", 0.0)
-            avg_ms = self._vla_total_cuda_time / max(1, self._vla_num_forward)
-            avg_tflops = (self._vla_total_flops / max(1, self._vla_num_forward)) * 1e-12
-            print(f"[ViT Profile] Current CUDA latency: {elapsed_ms:.6f} ms | Average CUDA latency: {avg_ms:.6f} ms, Average TFLOPs: {avg_tflops:.6f}")
+            self._vla_num_forward += 1
+            if self._vla_num_forward > self._vla_profile_warmup:
+                self._vla_total_cuda_time += elapsed_ms
+                eff_steps = max(1, self._vla_num_forward - self._vla_profile_warmup)
+                avg_ms = self._vla_total_cuda_time / eff_steps
+                avg_tflops = (self._vla_total_flops / eff_steps) * 1e-12
+                if self._vla_profile_print and (self._vla_profile_interval <= 0 or (self._vla_num_forward - self._vla_profile_warmup) % self._vla_profile_interval == 0):
+                    print(f"[ViT Profile] Current CUDA latency: {elapsed_ms:.6f} ms | Average CUDA latency: {avg_ms:.6f} ms, Average TFLOPs: {avg_tflops:.6f}")
 
         return result
 
