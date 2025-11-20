@@ -4,10 +4,12 @@ cd /home/lch/Documents/dcvla/src/openvla
 CUDA_VISIBLE_DEVICES=0 python experiments/robot/libero/run_libero_eval.py \
   --pretrained_checkpoint checkpoints/openvla-7b-finetuned-libero-spatial \
   --task_suite_name libero_spatial \
+  --local_log_dir "/home/lch/Documents/dcvla/results/test_vitcache" \
   --num_trials_per_task 1 \
   --num_tasks 1 \
   --task_start_id 0 \
-  --use_vla_cache False
+  --use_vla_cache True \
+  --use_vit_cache True > "/home/lch/Documents/dcvla/results/test_vitcache/terminal_log" 2>&1 &
 ```
 
 

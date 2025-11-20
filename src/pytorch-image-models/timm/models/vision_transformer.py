@@ -25,6 +25,8 @@ Hacked together by / Copyright 2020, Ross Wightman
 """
 import logging
 import math
+import os
+import weakref
 from collections import OrderedDict
 from functools import partial
 from typing import Callable, List, Optional, Sequence, Tuple, Type, Union
@@ -48,7 +50,42 @@ __all__ = ['VisionTransformer']  # model_registry will add each entrypoint fn to
 
 
 _logger = logging.getLogger(__name__)
+_debug_vit = os.environ.get("VLA_VIT_DEBUG", "0") == "1"
 _time_vit = True  # profiling enabled by default
+
+
+class VitBlockCache:
+    """Lightweight per-block cache for K/V tensors."""
+
+    def __init__(self, batch_size: int, num_heads: int, num_patches: int, head_dim: int, device, dtype):
+        self.k = torch.zeros(batch_size, num_heads, num_patches, head_dim, device=device, dtype=dtype)
+        self.v = torch.zeros(batch_size, num_heads, num_patches, head_dim, device=device, dtype=dtype)
+
+    @torch.no_grad()
+    def update(self, dynamic_idx: torch.Tensor, k_dyn: torch.Tensor, v_dyn: torch.Tensor):
+        if dynamic_idx.numel() == 0:
+            return
+        # dynamic_idx is patch indices; k_dyn/v_dyn shape [B, H, Nd, D]
+        self.k.index_copy_(2, dynamic_idx, k_dyn)
+        self.v.index_copy_(2, dynamic_idx, v_dyn)
+
+
+class VitCacheContext:
+    """Holds one-call cache context for Attention without changing forward signature."""
+
+    def __init__(
+            self,
+            reuse_mask: Optional[torch.Tensor],
+            cache: Optional[VitBlockCache],
+            cache_container: Optional[List[Optional[VitBlockCache]]],
+            cache_index: Optional[int],
+            cache_enabled: bool,
+    ):
+        self.reuse_mask = reuse_mask
+        self.cache = cache
+        self.cache_container = cache_container
+        self.cache_index = cache_index
+        self.cache_enabled = cache_enabled
 
 
 class Attention(nn.Module):
@@ -78,14 +115,98 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x):
+        # VLA cache context (set externally each call)
+        self._vla_ctx: Optional[VitCacheContext] = None
+
+    def set_cache_context(self, ctx: Optional[VitCacheContext]):
+        self._vla_ctx = ctx
+
+    def forward(self, x: torch.Tensor):
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
-        q, k = self.q_norm(q), self.k_norm(k)
+
+        ctx = getattr(self, "_vla_ctx", None)
+        reuse_mask = ctx.reuse_mask if ctx is not None else None
+        cache = ctx.cache if ctx is not None else None
+        cache_container = ctx.cache_container if ctx is not None else None
+        cache_index = ctx.cache_index if ctx is not None else None
+        cache_enabled = ctx.cache_enabled if ctx is not None else False
+
+        def _project_q(all_tokens: torch.Tensor) -> torch.Tensor:
+            q = F.linear(
+                all_tokens,
+                self.qkv.weight[: self.num_heads * self.head_dim, :],
+                None if self.qkv.bias is None else self.qkv.bias[: self.num_heads * self.head_dim],
+            )
+            q = q.view(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+            return self.q_norm(q)
+
+        def _project_kv(selected_tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+            kv = F.linear(
+                selected_tokens,
+                self.qkv.weight[self.num_heads * self.head_dim :, :],
+                None if self.qkv.bias is None else self.qkv.bias[self.num_heads * self.head_dim :],
+            )
+            kv = kv.view(selected_tokens.shape[0], selected_tokens.shape[1], 2, self.num_heads, self.head_dim)
+            kv = kv.permute(2, 0, 3, 1, 4)
+            k_sel, v_sel = kv.unbind(0)
+            return self.k_norm(k_sel), v_sel
+
+        use_reuse = (
+            cache_enabled
+            and reuse_mask is not None
+            and reuse_mask.numel() == N
+            and cache_container is not None
+            and cache_index is not None
+            and reuse_mask.dtype == torch.bool
+        )
+
+        if not use_reuse or cache is None:
+            if _debug_vit and cache_enabled:
+                print(f"[ViT-KV] cache disabled or missing for block {cache_index}, fallback full qkv (mask? {reuse_mask is not None})")
+            qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv.unbind(0)
+            q, k = self.q_norm(q), self.k_norm(k)
+            # If reuse intended but no cache existed, initialize cache for future frames.
+            if cache_enabled and cache_container is not None and cache_index is not None and cache is None:
+                cache = VitBlockCache(
+                    batch_size=B,
+                    num_heads=self.num_heads,
+                    num_patches=N,
+                    head_dim=self.head_dim,
+                    device=x.device,
+                    dtype=x.dtype,
+                )
+                cache.update(torch.arange(N, device=x.device), k, v)
+                if _debug_vit:
+                    print(f"[ViT-KV] init cache block {cache_index} with full K/V, N={N}")
+        else:
+            dynamic_idx = (~reuse_mask).nonzero(as_tuple=True)[0]
+
+            if cache is None:
+                cache = VitBlockCache(
+                    batch_size=B,
+                    num_heads=self.num_heads,
+                    num_patches=N,
+                    head_dim=self.head_dim,
+                    device=x.device,
+                    dtype=x.dtype,
+                )
+
+            q = _project_q(x)
+
+            if dynamic_idx.numel() > 0:
+                k_dyn, v_dyn = _project_kv(x[:, dynamic_idx, :])
+                cache.update(dynamic_idx, k_dyn, v_dyn)
+                if _debug_vit:
+                    print(f"[ViT-KV] reuse block {cache_index}: static={reuse_mask.sum().item()} dynamic={dynamic_idx.numel()}")
+            elif _debug_vit:
+                print(f"[ViT-KV] reuse block {cache_index}: all static, dynamic=0")
+
+            k = cache.k
+            v = cache.v
 
         if self.fused_attn:
-            x = F.scaled_dot_product_attention(
+            out = F.scaled_dot_product_attention(
                 q, k, v,
                 dropout_p=self.attn_drop.p if self.training else 0.,
             )
@@ -94,12 +215,16 @@ class Attention(nn.Module):
             attn = q @ k.transpose(-2, -1)
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
-            x = attn @ v
+            out = attn @ v
 
-        x = x.transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
+        out = out.transpose(1, 2).reshape(B, N, C)
+        out = self.proj(out)
+        out = self.proj_drop(out)
+
+        if cache_enabled and cache_container is not None and cache_index is not None and cache is not None:
+            cache_container[cache_index] = cache
+
+        return out
 
 
 class LayerScale(nn.Module):
@@ -154,7 +279,46 @@ class Block(nn.Module):
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
     def forward(self, x):
-        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
+        reuse_mask = None
+        cache_enabled = False
+
+        parent_ref = getattr(self, "_vla_parent_ref", None)
+        parent = parent_ref() if parent_ref is not None else None
+        if parent is not None and getattr(parent, "_vla_cache_enabled", False):
+            reuse_mask = getattr(parent, "_vla_reuse_mask", None)
+            cache_container = getattr(parent, "_vla_cache_state", None)
+            cache_index = getattr(self, "vla_index", None)
+            if (
+                reuse_mask is not None
+                and cache_container is not None
+                and cache_index is not None
+                and cache_index < len(cache_container)
+                and reuse_mask.numel() == x.shape[1]
+                and reuse_mask.dtype == torch.bool
+            ):
+                cache_enabled = True
+                cache = cache_container[cache_index]
+                if _debug_vit:
+                    num_static = reuse_mask.sum().item()
+                    print(f"[ViT-Block] enabling reuse block {cache_index}: seq_len={x.shape[1]} static={num_static}")
+                ctx = VitCacheContext(
+                    reuse_mask=reuse_mask,
+                    cache=cache,
+                    cache_container=cache_container,
+                    cache_index=cache_index,
+                    cache_enabled=cache_enabled,
+                )
+                self.attn.set_cache_context(ctx)
+            else:
+                self.attn.set_cache_context(None)
+                if _debug_vit and reuse_mask is not None:
+                    print(f"[ViT-Block] reuse mask ignored block {cache_index}, mask_len={reuse_mask.numel()} seq_len={x.shape[1]}")
+        else:
+            self.attn.set_cache_context(None)
+
+        x_norm = self.norm1(x)
+        attn_out = self.attn(x_norm)
+        x = x + self.drop_path1(self.ls1(attn_out))
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
         return x
 
@@ -528,11 +692,21 @@ class VisionTransformer(nn.Module):
         self.head_drop = nn.Dropout(drop_rate)
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
+        # VLA cache (ViT-side) state
+        self._vla_cache_state: Optional[List[Optional[VitBlockCache]]] = [None] * depth
+        self._vla_reuse_mask: Optional[torch.Tensor] = None
+        self._vla_cache_enabled = False
+
         self._vla_time_enabled = _time_vit
         self._vla_total_cuda_time = 0.0
         self._vla_num_forward = 0
         self._vla_total_flops = 0.0
         self._vla_last_flops = 0.0
+
+        for idx, blk in enumerate(self.blocks):
+            blk._vla_parent_ref = weakref.ref(self)
+            blk.vla_index = idx
+
         if weight_init != 'skip':
             self.init_weights(weight_init)
 
@@ -566,6 +740,23 @@ class VisionTransformer(nn.Module):
     @torch.jit.ignore
     def set_grad_checkpointing(self, enable=True):
         self.grad_checkpointing = enable
+
+    @torch.jit.ignore
+    def set_vla_cache_state(self, cache_state: Optional[List[Optional[VitBlockCache]]], reuse_mask: Optional[torch.Tensor]):
+        """Set ViT-side cache and patch reuse mask for VLA-Cache inference."""
+        self._vla_cache_state = cache_state if cache_state is not None else [None] * len(self.blocks)
+        self._vla_reuse_mask = reuse_mask
+        self._vla_cache_enabled = reuse_mask is not None
+
+    @torch.jit.ignore
+    def get_vla_cache_state(self) -> Optional[List[Optional[VitBlockCache]]]:
+        return self._vla_cache_state
+
+    @torch.jit.ignore
+    def reset_vla_cache(self):
+        self._vla_cache_state = [None] * len(self.blocks)
+        self._vla_reuse_mask = None
+        self._vla_cache_enabled = False
 
     @torch.jit.ignore
     def get_classifier(self):
@@ -681,6 +872,8 @@ class VisionTransformer(nn.Module):
 
         if return_prefix_tokens:
             return tuple(zip(outputs, prefix_tokens))
+        result = tuple(outputs)
+
         if timing:
             end_event.record()
             torch.cuda.synchronize()

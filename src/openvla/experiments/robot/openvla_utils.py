@@ -24,6 +24,9 @@ from .vla_cache_utils import find_static_patches, task_relevant_selection, get_l
 
 from transformers import DynamicCache
 
+# Debug flag for optional verbose logging
+DEBUG_VIT = os.environ.get("VLA_VIT_DEBUG", "0") == "1"
+
 # Initialize important constants and pretty-printing mode in NumPy.
 ACTION_DIM = 7
 DATE = time.strftime("%Y_%m_%d")
@@ -376,6 +379,7 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
     result_image = image
     prev_image = Image.fromarray(obs["prev_image"])
     prompt_cache = last_caches['past_key_values'] if last_caches is not None else None
+    vit_cache = last_caches.get('vit_cache') if last_caches is not None else None
     prev_attn = last_caches['attentions'] if last_caches is not None else None
     mask_indices = None
     vla.language_model.config.proportion_attn_var = None
@@ -388,6 +392,7 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
         image = process_image(image)
         prev_image = process_image(prev_image)
 
+    reuse_mask_full = None
     if cfg.use_vla_cache:
         print(">> VLA-Cache inference mode")
         # Step 1: Identify visually stable patches across frames
@@ -411,6 +416,42 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
         prompt_cache = None
         mask_indices = None
 
+    # Configure ViT KV cache reuse (static patch K/V)
+    vit_cache_out = None
+    if cfg.use_vit_cache:
+        # Helpers to set cache/mask on each featurizer
+        def _prepare_featurizer(featurizer, cache_payload, mask_idx):
+            num_prefix = getattr(featurizer, "num_prefix_tokens", 0)
+            num_patches = featurizer.patch_embed.num_patches
+            reuse_mask_local = torch.zeros(num_prefix + num_patches, dtype=torch.bool, device=DEVICE)
+            if mask_idx is not None:
+                # Clamp to available patches to be robust
+                valid_idx = mask_idx[mask_idx < num_patches]
+                reuse_mask_local[num_prefix + valid_idx] = True
+            cache_state = cache_payload if cache_payload is not None else [None] * len(featurizer.blocks)
+            featurizer.set_vla_cache_state(cache_state, reuse_mask_local)
+            if DEBUG_VIT:
+                print(f"[ViT-Setup] mask_len={reuse_mask_local.numel()} static={reuse_mask_local.sum().item()} num_prefix={num_prefix} num_patches={num_patches}")
+            return reuse_mask_local
+
+        # Primary featurizer
+        reuse_mask_full = _prepare_featurizer(vla.vision_backbone.featurizer, None if vit_cache is None else vit_cache.get("alpha"), mask_indices)
+
+        # Fused backbone (if exists) uses同样的缓存/掩码策略
+        if getattr(vla.vision_backbone, "use_fused_vision_backbone", False):
+            _prepare_featurizer(
+                vla.vision_backbone.fused_featurizer,
+                None if vit_cache is None else vit_cache.get("beta"),
+                mask_indices,
+            )
+    else:
+        # Ensure stale cache not reused
+        if hasattr(vla.vision_backbone.featurizer, "reset_vla_cache"):
+            vla.vision_backbone.featurizer.reset_vla_cache()
+        if getattr(vla.vision_backbone, "use_fused_vision_backbone", False):
+            if hasattr(vla.vision_backbone.fused_featurizer, "reset_vla_cache"):
+                vla.vision_backbone.fused_featurizer.reset_vla_cache()
+
     if prompt_cache is None:
         prompt_cache = DynamicCache()
         
@@ -428,6 +469,14 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
     # Get action.
     action, last_caches = vla.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=False, return_dict_in_generate=True, 
                                                         output_attentions = True, past_key_values=prompt_cache)
+    # Collect ViT cache for next frame
+    if cfg.use_vit_cache:
+        vit_cache_out = {
+            "alpha": vla.vision_backbone.featurizer.get_vla_cache_state()
+        }
+        if getattr(vla.vision_backbone, "use_fused_vision_backbone", False):
+            vit_cache_out["beta"] = vla.vision_backbone.fused_featurizer.get_vla_cache_state()
+        last_caches["vit_cache"] = vit_cache_out
    
     result_image = np.array(result_image)
     return action, last_caches, result_image

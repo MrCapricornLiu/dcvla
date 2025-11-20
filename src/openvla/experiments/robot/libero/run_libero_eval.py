@@ -58,6 +58,8 @@ class GenerateConfig:
 
     # Use VLA-Cache for faster inference
     use_vla_cache: bool = True
+    # Enable ViT-side KV cache reuse (static patch K/V)
+    use_vit_cache: bool = False
     
     #################################################################################################################
     # Model-specific parameters
