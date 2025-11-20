@@ -393,10 +393,12 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
         prev_image = process_image(prev_image)
 
     reuse_mask_full = None
-    if cfg.use_vla_cache:
-        print(">> VLA-Cache inference mode")
+    if cfg.use_vla_cache or (cfg.use_vit_cache and cfg.vit_cache_standalone):
+        mode_msg = ">> VLA-Cache inference mode" if cfg.use_vla_cache else ">> ViT-Cache only mode"
+        print(mode_msg)
         # Step 1: Identify visually stable patches across frames
-        if prompt_cache is not None:
+        stable_patches = None
+        if prompt_cache is not None or cfg.vit_cache_standalone:
             stable_patches = find_static_patches(image, prev_image, top_k=130)
 
         # Step 2: Use prior attention to filter out task-relevant tokens
@@ -408,8 +410,13 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
             # Step 3: Merge remaining static token indices and update model config
             mask_indices = torch.tensor(remaining_static_tokens_indices, device=DEVICE) if remaining_static_tokens_indices else None
 
-            vla.language_model.config.reusable_patches = mask_indices
-            vla.language_model.config.proportion_attn_var = get_layer_mask_schedule(prev_attn)
+            if cfg.use_vla_cache:
+                vla.language_model.config.reusable_patches = mask_indices
+                vla.language_model.config.proportion_attn_var = get_layer_mask_schedule(prev_attn)
+
+        if not cfg.use_vla_cache:
+            # Ensure LLM cache stays off when only using ViT cache
+            prompt_cache = None
 
     else:
         print(">> VLA-Cache disabled")
