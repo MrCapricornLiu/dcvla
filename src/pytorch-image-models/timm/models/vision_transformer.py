@@ -681,7 +681,18 @@ class VisionTransformer(nn.Module):
 
         if return_prefix_tokens:
             return tuple(zip(outputs, prefix_tokens))
-        return tuple(outputs)
+        if timing:
+            end_event.record()
+            torch.cuda.synchronize()
+            elapsed_ms = start_event.elapsed_time(end_event)
+            self._vla_total_cuda_time += elapsed_ms
+            self._vla_num_forward += 1
+            self._vla_total_flops += getattr(self, "_vla_last_flops", 0.0)
+            avg_ms = self._vla_total_cuda_time / max(1, self._vla_num_forward)
+            avg_tflops = (self._vla_total_flops / max(1, self._vla_num_forward)) * 1e-12
+            print(f"[ViT Profile] Current CUDA latency: {elapsed_ms:.6f} ms | Average CUDA latency: {avg_ms:.6f} ms, Average TFLOPs: {avg_tflops:.6f}")
+
+        return result
 
     def forward_features(self, x):
         x = self.patch_embed(x)
