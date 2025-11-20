@@ -393,21 +393,22 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
         prev_image = process_image(prev_image)
 
     reuse_mask_full = None
-    if cfg.use_vla_cache or (cfg.use_vit_cache and cfg.vit_cache_standalone):
-        mode_msg = ">> VLA-Cache inference mode" if cfg.use_vla_cache else ">> ViT-Cache only mode"
+    # Always run ViT mask setup (benchmark or real cache)
+    if True:
+        if cfg.use_vit_cache:
+            mode_msg = ">> ViT cache + VLA on" if cfg.use_vla_cache else ">> ViT cache + VLA off"
+        else:
+            mode_msg = ">> ViT benchmark + VLA on" if cfg.use_vla_cache else ">> ViT benchmark + VLA off"
         print(mode_msg)
-        # Step 1: Identify visually stable patches across frames
+
         stable_patches = None
-        if prompt_cache is not None or cfg.vit_cache_standalone:
+        if prompt_cache is not None or cfg.vit_cache_standalone or cfg.vit_cache_benchmark:
             stable_patches = find_static_patches(image, prev_image, top_k=130)
 
-        # Step 2: Use prior attention to filter out task-relevant tokens
         if prev_attn is not None:
             result_image, remaining_static_tokens_indices = task_relevant_selection(
                 prev_attn, image, stable_patches
             )
-
-            # Step 3: Merge remaining static token indices and update model config
             mask_indices = torch.tensor(remaining_static_tokens_indices, device=DEVICE) if remaining_static_tokens_indices else None
 
             if cfg.use_vla_cache:
@@ -415,7 +416,7 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
                 vla.language_model.config.proportion_attn_var = get_layer_mask_schedule(prev_attn)
 
         if not cfg.use_vla_cache:
-            # Ensure LLM cache stays off when only using ViT cache
+            # honor flag: do not reuse LLaMA cache when VLA-Cache is off
             prompt_cache = None
 
     else:
@@ -425,7 +426,8 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
 
     # Configure ViT KV cache reuse (static patch K/V)
     vit_cache_out = None
-    if cfg.use_vit_cache:
+    enable_vit = True  # always run ViT cache pipeline (benchmark or real reuse)
+    if enable_vit:
         # Helpers to set cache/mask on each featurizer
         def _prepare_featurizer(featurizer, cache_payload, mask_idx):
             num_prefix = getattr(featurizer, "num_prefix_tokens", 0)
@@ -435,8 +437,10 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
                 # Clamp to available patches to be robust
                 valid_idx = mask_idx[mask_idx < num_patches]
                 reuse_mask_local[num_prefix + valid_idx] = True
-            cache_state = cache_payload if cache_payload is not None else [None] * len(featurizer.blocks)
-            featurizer.set_vla_cache_state(cache_state, reuse_mask_local)
+            # Benchmark模式强制不复用缓存
+            use_cache_payload = (cache_payload is not None and cfg.use_vit_cache and not cfg.vit_cache_benchmark)
+            cache_state = cache_payload if use_cache_payload else [None] * len(featurizer.blocks)
+            featurizer.set_vla_cache_state(cache_state, reuse_mask_local, enable_reuse=cfg.use_vit_cache)
             static_count = reuse_mask_local.sum().item()
             total_count = reuse_mask_local.numel()
             ratio = static_count / max(1, total_count)
@@ -481,7 +485,7 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
     action, last_caches = vla.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=False, return_dict_in_generate=True, 
                                                         output_attentions = True, past_key_values=prompt_cache)
     # Collect ViT cache for next frame
-    if cfg.use_vit_cache:
+    if cfg.use_vit_cache and not cfg.vit_cache_benchmark:
         vit_cache_out = {
             "alpha": vla.vision_backbone.featurizer.get_vla_cache_state()
         }

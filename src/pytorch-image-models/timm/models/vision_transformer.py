@@ -801,11 +801,11 @@ class VisionTransformer(nn.Module):
         self.grad_checkpointing = enable
 
     @torch.jit.ignore
-    def set_vla_cache_state(self, cache_state: Optional[List[Optional[VitBlockCache]]], reuse_mask: Optional[torch.Tensor]):
+    def set_vla_cache_state(self, cache_state: Optional[List[Optional[VitBlockCache]]], reuse_mask: Optional[torch.Tensor], enable_reuse: bool = True):
         """Set ViT-side cache and patch reuse mask for VLA-Cache inference."""
         self._vla_cache_state = cache_state if cache_state is not None else [None] * len(self.blocks)
         self._vla_reuse_mask = reuse_mask
-        self._vla_cache_enabled = reuse_mask is not None
+        self._vla_cache_enabled = enable_reuse and reuse_mask is not None
 
     @torch.jit.ignore
     def get_vla_cache_state(self) -> Optional[List[Optional[VitBlockCache]]]:
@@ -876,7 +876,8 @@ class VisionTransformer(nn.Module):
 
         # Estimate static tokens (if provided) to approximate reduced compute
         reuse_mask = getattr(self, "_vla_reuse_mask", None)
-        static_tokens = reuse_mask.sum().item() if reuse_mask is not None else 0
+        cache_active = getattr(self, "_vla_cache_enabled", False)
+        static_tokens = reuse_mask.sum().item() if (reuse_mask is not None and cache_active) else 0
 
         # forward pass
         x = self.patch_embed(x)

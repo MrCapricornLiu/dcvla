@@ -62,6 +62,8 @@ class GenerateConfig:
     use_vit_cache: bool = False
     # Allow ViT cache to run even when LLM VLA-Cache is disabled
     vit_cache_standalone: bool = False
+    # Benchmark mode always on: run ViT cache pipeline even when reuse is disabled
+    vit_cache_benchmark: bool = True
     
     #################################################################################################################
     # Model-specific parameters
