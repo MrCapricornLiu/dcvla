@@ -757,7 +757,7 @@ class VisionTransformer(nn.Module):
         self._vla_num_forward = 0
         self._vla_total_flops = 0.0
         self._vla_last_flops = 0.0
-        self._vla_profile_warmup = int(os.environ.get("VLA_VIT_PROFILE_WARMUP", 0))
+        self._vla_profile_warmup = int(os.environ.get("VLA_VIT_PROFILE_WARMUP", 20))
         # Print every call by default; override via env if needed
         self._vla_profile_interval = int(os.environ.get("VLA_VIT_PROFILE_INTERVAL", 1))
         self._vla_profile_print = os.environ.get("VLA_VIT_PROFILE_PRINT", "1") == "1"
@@ -877,7 +877,6 @@ class VisionTransformer(nn.Module):
         # Estimate static tokens (if provided) to approximate reduced compute
         reuse_mask = getattr(self, "_vla_reuse_mask", None)
         cache_active = getattr(self, "_vla_cache_enabled", False)
-        static_tokens = reuse_mask.sum().item() if (reuse_mask is not None and cache_active) else 0
 
         # forward pass
         x = self.patch_embed(x)
@@ -893,17 +892,18 @@ class VisionTransformer(nn.Module):
                 n_tok = x.shape[1]
                 d = x.shape[2]
                 m = getattr(blk.mlp, "fc1").out_features if hasattr(blk.mlp, "fc1") else d * 4
-                if reuse_mask is not None and reuse_mask.numel() == n_tok:
+                if cache_active and reuse_mask is not None and reuse_mask.numel() == n_tok:
+                    static_tokens = reuse_mask.sum().item()
                     dyn = max(n_tok - static_tokens, 0)
+                    # Projections: Q/K/V for dynamic, output for all
+                    proj_flops = (3 * dyn + n_tok) * (d ** 2)
+                    # Attention matmul: dynamic queries over full KV
+                    attn_flops = 2 * dyn * n_tok * d
+                    # MLP only for dynamic tokens
+                    mlp_flops = 3 * dyn * d * m
+                    flops_block = proj_flops + attn_flops + mlp_flops
                 else:
-                    dyn = n_tok
-                # Projections: Q/K/V for dynamic, output for all
-                proj_flops = (3 * dyn + n_tok) * (d ** 2)
-                # Attention matmul: dynamic queries over full KV
-                attn_flops = 2 * dyn * n_tok * d
-                # MLP only for dynamic tokens
-                mlp_flops = 3 * dyn * d * m
-                flops_block = proj_flops + attn_flops + mlp_flops
+                    flops_block = 4 * n_tok * (d ** 2) + 2 * (n_tok ** 2) * d + 3 * n_tok * d * m
                 flops_total += flops_block
             except Exception:
                 pass
@@ -952,14 +952,14 @@ class VisionTransformer(nn.Module):
             end_event.record()
             torch.cuda.synchronize()
             elapsed_ms = start_event.elapsed_time(end_event)
-            self._vla_total_flops += getattr(self, "_vla_last_flops", 0.0)
             self._vla_num_forward += 1
             if self._vla_num_forward > self._vla_profile_warmup:
+                self._vla_total_flops += getattr(self, "_vla_last_flops", 0.0)
                 self._vla_total_cuda_time += elapsed_ms
                 eff_steps = max(1, self._vla_num_forward - self._vla_profile_warmup)
                 avg_ms = self._vla_total_cuda_time / eff_steps
                 avg_tflops = (self._vla_total_flops / eff_steps) * 1e-12
-                if self._vla_profile_print and (self._vla_profile_interval <= 0 or (self._vla_num_forward - self._vla_profile_warmup) % self._vla_profile_interval == 0):
+                if self._vla_profile_print and (self._vla_profile_interval <= 0 or (eff_steps % self._vla_profile_interval == 0)):
                     print(f"[ViT Profile] Current CUDA latency: {elapsed_ms:.6f} ms | Average CUDA latency: {avg_ms:.6f} ms, Average TFLOPs: {avg_tflops:.6f}")
 
         return result
