@@ -60,6 +60,8 @@ class VitBlockCache:
     def __init__(self, batch_size: int, num_heads: int, num_patches: int, head_dim: int, device, dtype):
         self.k = torch.zeros(batch_size, num_heads, num_patches, head_dim, device=device, dtype=dtype)
         self.v = torch.zeros(batch_size, num_heads, num_patches, head_dim, device=device, dtype=dtype)
+        self.attn_out: Optional[torch.Tensor] = None  # [B, num_tokens, dim]
+        self.mlp_out: Optional[torch.Tensor] = None   # [B, num_tokens, dim]
 
     @torch.no_grad()
     def update(self, dynamic_idx: torch.Tensor, k_dyn: torch.Tensor, v_dyn: torch.Tensor):
@@ -132,21 +134,23 @@ class Attention(nn.Module):
         cache_enabled = ctx.cache_enabled if ctx is not None else False
 
         def _project_q(all_tokens: torch.Tensor) -> torch.Tensor:
+            B_local, N_local, _ = all_tokens.shape
             q = F.linear(
                 all_tokens,
                 self.qkv.weight[: self.num_heads * self.head_dim, :],
                 None if self.qkv.bias is None else self.qkv.bias[: self.num_heads * self.head_dim],
             )
-            q = q.view(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+            q = q.view(B_local, N_local, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
             return self.q_norm(q)
 
         def _project_kv(selected_tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+            B_local, N_local, _ = selected_tokens.shape
             kv = F.linear(
                 selected_tokens,
                 self.qkv.weight[self.num_heads * self.head_dim :, :],
                 None if self.qkv.bias is None else self.qkv.bias[self.num_heads * self.head_dim :],
             )
-            kv = kv.view(selected_tokens.shape[0], selected_tokens.shape[1], 2, self.num_heads, self.head_dim)
+            kv = kv.view(B_local, N_local, 2, self.num_heads, self.head_dim)
             kv = kv.permute(2, 0, 3, 1, 4)
             k_sel, v_sel = kv.unbind(0)
             return self.k_norm(k_sel), v_sel
@@ -160,7 +164,7 @@ class Attention(nn.Module):
             and reuse_mask.dtype == torch.bool
         )
 
-        if not use_reuse or cache is None:
+        if not use_reuse or cache is None or cache.attn_out is None:
             if _debug_vit and cache_enabled:
                 print(f"[ViT-KV] cache disabled or missing for block {cache_index}, fallback full qkv (mask? {reuse_mask is not None})")
             qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
@@ -181,6 +185,7 @@ class Attention(nn.Module):
                     print(f"[ViT-KV] init cache block {cache_index} with full K/V, N={N}")
         else:
             dynamic_idx = (~reuse_mask).nonzero(as_tuple=True)[0]
+            static_idx = reuse_mask.nonzero(as_tuple=True)[0]
 
             if cache is None:
                 cache = VitBlockCache(
@@ -192,7 +197,11 @@ class Attention(nn.Module):
                     dtype=x.dtype,
                 )
 
-            q = _project_q(x)
+            # Only compute Q for dynamic queries
+            if dynamic_idx.numel() > 0:
+                q_dyn = _project_q(x[:, dynamic_idx, :])
+            else:
+                q_dyn = None
 
             if dynamic_idx.numel() > 0:
                 k_dyn, v_dyn = _project_kv(x[:, dynamic_idx, :])
@@ -205,26 +214,56 @@ class Attention(nn.Module):
             k = cache.k
             v = cache.v
 
-        if self.fused_attn:
-            out = F.scaled_dot_product_attention(
-                q, k, v,
-                dropout_p=self.attn_drop.p if self.training else 0.,
-            )
+        if use_reuse and cache is not None and cache.attn_out is not None:
+            # Only compute attention outputs for dynamic queries
+            if dynamic_idx.numel() > 0:
+                if self.fused_attn:
+                    out_dyn = F.scaled_dot_product_attention(
+                        q_dyn, k, v,
+                        dropout_p=self.attn_drop.p if self.training else 0.,
+                    )
+                else:
+                    q_dyn = q_dyn * self.scale
+                    attn = q_dyn @ k.transpose(-2, -1)
+                    attn = attn.softmax(dim=-1)
+                    attn = self.attn_drop(attn)
+                    out_dyn = attn @ v
+                attn_dyn = out_dyn.transpose(1, 2).reshape(B, dynamic_idx.numel(), C)
+                attn_full = cache.attn_out.to(attn_dyn.dtype)
+                attn_full.index_copy_(1, dynamic_idx, attn_dyn)
+                if _debug_vit:
+                    print(f"[ViT-Attn] block {cache_index} reuse: static={static_idx.numel()} dynamic={dynamic_idx.numel()}")
+            else:
+                attn_full = cache.attn_out
+            proj_full = self.proj(attn_full)
+            proj_full = self.proj_drop(proj_full)
+            out = proj_full
+            attn_out = attn_full
+            cache.attn_out = attn_full.detach()
         else:
-            q = q * self.scale
-            attn = q @ k.transpose(-2, -1)
-            attn = attn.softmax(dim=-1)
-            attn = self.attn_drop(attn)
-            out = attn @ v
+            # Full attention path
+            if self.fused_attn:
+                out = F.scaled_dot_product_attention(
+                    q, k, v,
+                    dropout_p=self.attn_drop.p if self.training else 0.,
+                )
+            else:
+                q = q * self.scale
+                attn = q @ k.transpose(-2, -1)
+                attn = attn.softmax(dim=-1)
+                attn = self.attn_drop(attn)
+                out = attn @ v
 
-        out = out.transpose(1, 2).reshape(B, N, C)
-        out = self.proj(out)
-        out = self.proj_drop(out)
+            attn_out = out.transpose(1, 2).reshape(B, N, C)
+            out = self.proj(attn_out)
+            out = self.proj_drop(out)
+            if cache_enabled and cache is not None:
+                cache.attn_out = attn_out.detach()
 
         if cache_enabled and cache_container is not None and cache_index is not None and cache is not None:
             cache_container[cache_index] = cache
 
-        return out
+        return out, attn_out
 
 
 class LayerScale(nn.Module):
@@ -317,9 +356,25 @@ class Block(nn.Module):
             self.attn.set_cache_context(None)
 
         x_norm = self.norm1(x)
-        attn_out = self.attn(x_norm)
-        x = x + self.drop_path1(self.ls1(attn_out))
-        x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
+        attn_proj, attn_pre = self.attn(x_norm)
+
+        x = x + self.drop_path1(self.ls1(attn_proj))
+
+        x_norm2 = self.norm2(x)
+        if cache_enabled and cache is not None and cache.mlp_out is not None:
+            dynamic_idx = (~reuse_mask).nonzero(as_tuple=True)[0]
+            mlp_full = cache.mlp_out.to(x.dtype)
+            if dynamic_idx.numel() > 0:
+                mlp_dyn = self.mlp(x_norm2[:, dynamic_idx, :])
+                mlp_full.index_copy_(1, dynamic_idx, mlp_dyn)
+            x = x + self.drop_path2(self.ls2(mlp_full))
+            cache.mlp_out = mlp_full
+        else:
+            mlp_out = self.mlp(x_norm2)
+            x = x + self.drop_path2(self.ls2(mlp_out))
+            if cache_enabled and cache is not None:
+                cache.mlp_out = mlp_out.detach()
+
         return x
 
 
@@ -819,7 +874,7 @@ class VisionTransformer(nn.Module):
         flops_total = 0.0
         take_indices = set(range(num_blocks - n, num_blocks) if isinstance(n, int) else n)
 
-        # Estimate static tokens (if provided) to approximate saved K/V projections
+        # Estimate static tokens (if provided) to approximate reduced compute
         reuse_mask = getattr(self, "_vla_reuse_mask", None)
         static_tokens = reuse_mask.sum().item() if reuse_mask is not None else 0
 
@@ -837,9 +892,17 @@ class VisionTransformer(nn.Module):
                 n_tok = x.shape[1]
                 d = x.shape[2]
                 m = getattr(blk.mlp, "fc1").out_features if hasattr(blk.mlp, "fc1") else d * 4
-                base_flops = 4 * n_tok * (d ** 2) + 2 * (n_tok ** 2) * d + 3 * n_tok * d * m
-                saved_flops = 2 * static_tokens * (d ** 2)  # skip K/V projection for static tokens
-                flops_block = max(base_flops - saved_flops, 0)
+                if reuse_mask is not None and reuse_mask.numel() == n_tok:
+                    dyn = max(n_tok - static_tokens, 0)
+                else:
+                    dyn = n_tok
+                # Projections: Q/K/V for dynamic, output for all
+                proj_flops = (3 * dyn + n_tok) * (d ** 2)
+                # Attention matmul: dynamic queries over full KV
+                attn_flops = 2 * dyn * n_tok * d
+                # MLP only for dynamic tokens
+                mlp_flops = 3 * dyn * d * m
+                flops_block = proj_flops + attn_flops + mlp_flops
                 flops_total += flops_block
             except Exception:
                 pass
