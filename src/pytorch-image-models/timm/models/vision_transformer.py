@@ -62,7 +62,10 @@ class VitBlockCache:
         self.k = torch.zeros(batch_size, num_heads, num_patches, head_dim, device=device, dtype=dtype)
         self.v = torch.zeros(batch_size, num_heads, num_patches, head_dim, device=device, dtype=dtype)
         self.attn_out: Optional[torch.Tensor] = None  # [B, num_tokens, dim]
+        self.attn_proj: Optional[torch.Tensor] = None  # [B, num_tokens, dim]
         self.mlp_out: Optional[torch.Tensor] = None   # [B, num_tokens, dim]
+        self.block_out: Optional[torch.Tensor] = None  # [B, num_tokens, dim]
+        self.num_tokens = num_patches  # including prefix accounted separately
 
     @torch.no_grad()
     def update(self, dynamic_idx: torch.Tensor, k_dyn: torch.Tensor, v_dyn: torch.Tensor):
@@ -165,84 +168,72 @@ class Attention(nn.Module):
             and reuse_mask.dtype == torch.bool
         )
 
-        if not use_reuse or cache is None or cache.attn_out is None:
-            if _debug_vit and cache_enabled:
-                print(f"[ViT-KV] cache disabled or missing for block {cache_index}, fallback full qkv (mask? {reuse_mask is not None})")
-            qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-            q, k, v = qkv.unbind(0)
-            q, k = self.q_norm(q), self.k_norm(k)
-            # If reuse intended but no cache existed, initialize cache for future frames.
-            if cache_enabled and cache_container is not None and cache_index is not None and cache is None:
-                cache = VitBlockCache(
-                    batch_size=B,
-                    num_heads=self.num_heads,
-                    num_patches=N,
-                    head_dim=self.head_dim,
-                    device=x.device,
-                    dtype=x.dtype,
-                )
-                cache.update(torch.arange(N, device=x.device), k, v)
-                if _debug_vit:
-                    print(f"[ViT-KV] init cache block {cache_index} with full K/V, N={N}")
-        else:
+        # Lazily create cache on first use so full path can populate it
+        if use_reuse and cache is None:
+            cache = VitBlockCache(
+                batch_size=B,
+                num_heads=self.num_heads,
+                num_patches=N,
+                head_dim=self.head_dim,
+                device=x.device,
+                dtype=x.dtype,
+            )
+            cache_container[cache_index] = cache
+
+        reuse_ok = use_reuse and cache is not None and reuse_mask is not None and reuse_mask.numel() == N and cache.attn_out is not None
+        if _debug_vit:
+            print(f"[ViT-Attn] reuse_ok={reuse_ok} cache_enabled={cache_enabled} cache_init={cache is not None} attn_cached={cache.attn_out is not None if cache is not None else False}")
+
+        if reuse_ok:
             dynamic_idx = (~reuse_mask).nonzero(as_tuple=True)[0]
             static_idx = reuse_mask.nonzero(as_tuple=True)[0]
 
-            if cache is None:
-                cache = VitBlockCache(
-                    batch_size=B,
-                    num_heads=self.num_heads,
-                    num_patches=N,
-                    head_dim=self.head_dim,
-                    device=x.device,
-                    dtype=x.dtype,
-                )
-
-            # Only compute Q for dynamic queries
-            if dynamic_idx.numel() > 0:
-                q_dyn = _project_q(x[:, dynamic_idx, :])
-            else:
-                q_dyn = None
-
+            # Compute KV for dynamic tokens only
             if dynamic_idx.numel() > 0:
                 k_dyn, v_dyn = _project_kv(x[:, dynamic_idx, :])
                 cache.update(dynamic_idx, k_dyn, v_dyn)
-                if _debug_vit:
-                    print(f"[ViT-KV] reuse block {cache_index}: static={reuse_mask.sum().item()} dynamic={dynamic_idx.numel()}")
-            elif _debug_vit:
-                print(f"[ViT-KV] reuse block {cache_index}: all static, dynamic=0")
 
-            k = cache.k
-            v = cache.v
-
-        if use_reuse and cache is not None and cache.attn_out is not None:
-            # Only compute attention outputs for dynamic queries
+            # Compute attention for dynamic queries over SHORT sequence (dynamic only)
             if dynamic_idx.numel() > 0:
+                q_dyn = _project_q(x[:, dynamic_idx, :])
                 if self.fused_attn:
                     out_dyn = F.scaled_dot_product_attention(
-                        q_dyn, k, v,
+                        q_dyn, k_dyn, v_dyn,
                         dropout_p=self.attn_drop.p if self.training else 0.,
                     )
                 else:
                     q_dyn = q_dyn * self.scale
-                    attn = q_dyn @ k.transpose(-2, -1)
+                    attn = q_dyn @ k_dyn.transpose(-2, -1)
                     attn = attn.softmax(dim=-1)
                     attn = self.attn_drop(attn)
-                    out_dyn = attn @ v
+                    out_dyn = attn @ v_dyn
                 attn_dyn = out_dyn.transpose(1, 2).reshape(B, dynamic_idx.numel(), C)
-                attn_full = cache.attn_out.to(attn_dyn.dtype)
-                attn_full.index_copy_(1, dynamic_idx, attn_dyn)
-                if _debug_vit:
-                    print(f"[ViT-Attn] block {cache_index} reuse: static={static_idx.numel()} dynamic={dynamic_idx.numel()}")
+                attn_out = attn_dyn
+                out = self.proj_drop(self.proj(attn_dyn))
             else:
-                attn_full = cache.attn_out
-            proj_full = self.proj(attn_full)
-            proj_full = self.proj_drop(proj_full)
-            out = proj_full
-            attn_out = attn_full
-            cache.attn_out = attn_full.detach()
+                # all static: reuse cache outputs
+                attn_out = x.new_zeros(B, 0, C)
+                out = x.new_zeros(B, 0, C)
+
+            # Update cache only for dynamic slice; static slice stays cached
+            if cache.attn_out is None or cache.attn_out.shape[1] != N:
+                cache.attn_out = x.new_zeros(B, N, C, dtype=attn_out.dtype)
+            if cache.attn_proj is None or cache.attn_proj.shape[1] != N:
+                cache.attn_proj = x.new_zeros(B, N, C, dtype=out.dtype)
+            if dynamic_idx.numel() > 0:
+                cache.attn_out.index_copy_(1, dynamic_idx, attn_out.detach())
+                cache.attn_proj.index_copy_(1, dynamic_idx, out.detach())
+            if _debug_vit:
+                num_static = static_idx.numel()
+                num_dynamic = dynamic_idx.numel()
+                print(f"[ViT-Attn] block {cache_index} reuse (short seq): static={num_static} dynamic={num_dynamic}")
+
         else:
             # Full attention path
+            qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv.unbind(0)
+            q, k = self.q_norm(q), self.k_norm(k)
+
             if self.fused_attn:
                 out = F.scaled_dot_product_attention(
                     q, k, v,
@@ -258,10 +249,30 @@ class Attention(nn.Module):
             attn_out = out.transpose(1, 2).reshape(B, N, C)
             out = self.proj(attn_out)
             out = self.proj_drop(out)
-            if cache_enabled and cache is not None:
+            if cache_enabled:
+                if cache is None:
+                    cache = VitBlockCache(
+                        batch_size=B,
+                        num_heads=self.num_heads,
+                        num_patches=N,
+                        head_dim=self.head_dim,
+                        device=x.device,
+                        dtype=x.dtype,
+                    )
+                cache.k = k
+                cache.v = v
                 cache.attn_out = attn_out.detach()
+                cache.attn_proj = out.detach()
+                cache_container[cache_index] = cache
+                if _debug_vit:
+                    print(f"[ViT-Attn] cache_fill block {cache_index}: attn_out={cache.attn_out.shape} id={id(cache)}")
+            elif _debug_vit:
+                print(f"[ViT-Attn] cache not filled: cache_enabled={cache_enabled}, cache is None: {cache is None}, ctx set={ctx is not None}")
 
         if cache_enabled and cache_container is not None and cache_index is not None and cache is not None:
+            if _debug_vit:
+                attn_cached = cache.attn_out is not None
+                print(f"[ViT-Attn] cache_store block {cache_index}: attn_cached={attn_cached} id={id(cache)}")
             cache_container[cache_index] = cache
 
         return out, attn_out
@@ -359,24 +370,89 @@ class Block(nn.Module):
         x_norm = self.norm1(x)
         attn_proj, attn_pre = self.attn(x_norm)
 
-        x = x + self.drop_path1(self.ls1(attn_proj))
+        # Refresh cache reference after attention may have lazily created/updated it
+        if cache_enabled and cache_container is not None and cache_index is not None and cache_index < len(cache_container):
+            cache = cache_container[cache_index]
 
-        x_norm2 = self.norm2(x)
-        if cache_enabled and cache is not None and cache.mlp_out is not None:
+        x_attn = x + self.drop_path1(self.ls1(attn_proj))
+
+        if (
+            cache_enabled
+            and cache is not None
+            and cache.mlp_out is not None
+            and cache.block_out is not None
+            and reuse_mask is not None
+            and reuse_mask.numel() == x.shape[1]
+        ):
             dynamic_idx = (~reuse_mask).nonzero(as_tuple=True)[0]
-            mlp_full = cache.mlp_out.to(x.dtype)
-            if dynamic_idx.numel() > 0:
-                mlp_dyn = self.mlp(x_norm2[:, dynamic_idx, :])
-                mlp_full.index_copy_(1, dynamic_idx, mlp_dyn)
-            x = x + self.drop_path2(self.ls2(mlp_full))
-            cache.mlp_out = mlp_full
-        else:
-            mlp_out = self.mlp(x_norm2)
-            x = x + self.drop_path2(self.ls2(mlp_out))
-            if cache_enabled and cache is not None:
-                cache.mlp_out = mlp_out.detach()
+            if dynamic_idx.numel() == 0:
+                return cache.block_out.to(x.dtype)
 
-        return x
+            mlp_full = cache.mlp_out.to(x.dtype)
+            x_out = torch.empty_like(cache.block_out, dtype=x.dtype)
+
+            attn_proj_dyn = attn_proj[:, dynamic_idx, :]
+            x_attn_dyn = x[:, dynamic_idx, :] + self.drop_path1(self.ls1(attn_proj_dyn))
+            x_dyn_norm = self.norm2(x_attn_dyn)
+            mlp_dyn = self.mlp(x_dyn_norm)
+            mlp_full.index_copy_(1, dynamic_idx, mlp_dyn)
+            dyn_res = x_attn_dyn + self.drop_path2(self.ls2(mlp_dyn))
+            x_out.index_copy_(1, dynamic_idx, dyn_res)
+
+            # Static tokens: directly reuse cached block_out / mlp_out
+            static_idx = reuse_mask.nonzero(as_tuple=True)[0]
+            if static_idx.numel() > 0:
+                x_out[:, static_idx, :] = cache.block_out[:, static_idx, :].to(x.dtype)
+
+            cache.mlp_out = mlp_full.detach()
+            cache.block_out = x_out.detach()
+            if _debug_vit:
+                print(f"[ViT-MLP] block {cache_index} reuse fast path: static={reuse_mask.sum().item()} dynamic={dynamic_idx.numel()}")
+            return x_out
+
+        if cache_enabled and cache is not None and cache.mlp_out is not None and reuse_mask is not None and reuse_mask.numel() == x.shape[1]:
+            dynamic_idx = (~reuse_mask).nonzero(as_tuple=True)[0]
+            static_idx = reuse_mask.nonzero(as_tuple=True)[0]
+
+            mlp_full = cache.mlp_out.to(x.dtype)
+            x_out = x_attn.clone()
+
+            # Static: reuse cached MLP output
+            if static_idx.numel() > 0:
+                static_res = x_attn[:, static_idx, :] + self.drop_path2(self.ls2(mlp_full[:, static_idx, :]))
+                x_out[:, static_idx, :] = static_res
+
+            # Dynamic: compute fresh MLP on dynamic slice
+            if dynamic_idx.numel() > 0:
+                x_dyn_norm = self.norm2(x_attn[:, dynamic_idx, :])
+                mlp_dyn = self.mlp(x_dyn_norm)
+                mlp_full.index_copy_(1, dynamic_idx, mlp_dyn)
+                dyn_res = x_attn[:, dynamic_idx, :] + self.drop_path2(self.ls2(mlp_dyn))
+                x_out[:, dynamic_idx, :] = dyn_res
+                if _debug_vit:
+                    print(f"[ViT-MLP] block {cache_index} reuse: static={static_idx.numel()} dynamic={dynamic_idx.numel()}")
+
+            cache.mlp_out = mlp_full.detach()
+            cache.block_out = x_out.detach()
+            return x_out
+        else:
+            x_norm2 = self.norm2(x_attn)
+            mlp_out = self.mlp(x_norm2)
+            x_out = x_attn + self.drop_path2(self.ls2(mlp_out))
+            if cache_enabled:
+                if cache is None:
+                    cache = VitBlockCache(
+                        batch_size=x.shape[0],
+                        num_heads=self.attn.num_heads,
+                        num_patches=x.shape[1],
+                        head_dim=self.attn.head_dim,
+                        device=x.device,
+                        dtype=x.dtype,
+                    )
+                    cache_container[cache_index] = cache
+                cache.mlp_out = mlp_out.detach()
+                cache.block_out = x_out.detach()
+            return x_out
 
 
 class ResPostBlock(nn.Module):
