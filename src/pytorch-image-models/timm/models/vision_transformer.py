@@ -86,12 +86,14 @@ class VitCacheContext:
             cache_container: Optional[List[Optional[VitBlockCache]]],
             cache_index: Optional[int],
             cache_enabled: bool,
+            static_reuse_enabled: bool,
     ):
         self.reuse_mask = reuse_mask
         self.cache = cache
         self.cache_container = cache_container
         self.cache_index = cache_index
         self.cache_enabled = cache_enabled
+        self.static_reuse_enabled = static_reuse_enabled
 
 
 class Attention(nn.Module):
@@ -136,6 +138,7 @@ class Attention(nn.Module):
         cache_container = ctx.cache_container if ctx is not None else None
         cache_index = ctx.cache_index if ctx is not None else None
         cache_enabled = ctx.cache_enabled if ctx is not None else False
+        static_reuse_enabled = ctx.static_reuse_enabled if ctx is not None else False
 
         def _project_q(all_tokens: torch.Tensor) -> torch.Tensor:
             B_local, N_local, _ = all_tokens.shape
@@ -185,48 +188,57 @@ class Attention(nn.Module):
             print(f"[ViT-Attn] reuse_ok={reuse_ok} cache_enabled={cache_enabled} cache_init={cache is not None} attn_cached={cache.attn_out is not None if cache is not None else False}")
 
         if reuse_ok:
-            dynamic_idx = (~reuse_mask).nonzero(as_tuple=True)[0]
-            static_idx = reuse_mask.nonzero(as_tuple=True)[0]
+            # When static reuse is disabled, treat all tokens as dynamic but still follow the split path to match overhead.
+            effective_static = reuse_mask if static_reuse_enabled else torch.zeros_like(reuse_mask, dtype=torch.bool)
+            dynamic_idx = (~effective_static).nonzero(as_tuple=True)[0]
+            static_idx = effective_static.nonzero(as_tuple=True)[0]
 
             # Compute KV for dynamic tokens only
             if dynamic_idx.numel() > 0:
                 k_dyn, v_dyn = _project_kv(x[:, dynamic_idx, :])
                 cache.update(dynamic_idx, k_dyn, v_dyn)
 
-            # Compute attention for dynamic queries over SHORT sequence (dynamic only)
+            # Compute attention for dynamic queries over full KV (static + dynamic)
             if dynamic_idx.numel() > 0:
                 q_dyn = _project_q(x[:, dynamic_idx, :])
                 if self.fused_attn:
                     out_dyn = F.scaled_dot_product_attention(
-                        q_dyn, k_dyn, v_dyn,
+                        q_dyn, cache.k, cache.v,
                         dropout_p=self.attn_drop.p if self.training else 0.,
                     )
                 else:
                     q_dyn = q_dyn * self.scale
-                    attn = q_dyn @ k_dyn.transpose(-2, -1)
+                    attn = q_dyn @ cache.k.transpose(-2, -1)
                     attn = attn.softmax(dim=-1)
                     attn = self.attn_drop(attn)
-                    out_dyn = attn @ v_dyn
+                    out_dyn = attn @ cache.v
                 attn_dyn = out_dyn.transpose(1, 2).reshape(B, dynamic_idx.numel(), C)
-                attn_out = attn_dyn
-                out = self.proj_drop(self.proj(attn_dyn))
+                # Assemble full outputs with a single allocation; static slices reuse cache, dynamic slices freshly computed
+                attn_full = x.new_empty(B, N, C)
+                proj_full = x.new_empty(B, N, C)
+                if static_idx.numel() > 0 and cache.attn_out is not None and cache.attn_out.shape[1] == N:
+                    attn_full[:, static_idx, :] = cache.attn_out[:, static_idx, :]
+                if static_idx.numel() > 0 and cache.attn_proj is not None and cache.attn_proj.shape[1] == N:
+                    proj_full[:, static_idx, :] = cache.attn_proj[:, static_idx, :]
+                attn_full.index_copy_(1, dynamic_idx, attn_dyn)
+                proj_dyn = self.proj(attn_dyn)
+                proj_full.index_copy_(1, dynamic_idx, proj_dyn)
+                proj_full = self.proj_drop(proj_full)
+
+                cache.attn_out = attn_full.detach()
+                cache.attn_proj = proj_full.detach()
+                attn_out = attn_full
+                out = proj_full
             else:
                 # all static: reuse cache outputs
-                attn_out = x.new_zeros(B, 0, C)
-                out = x.new_zeros(B, 0, C)
+                attn_out = cache.attn_out
+                out = cache.attn_proj if cache.attn_proj is not None else self.proj_drop(self.proj(attn_out))
 
             # Update cache only for dynamic slice; static slice stays cached
-            if cache.attn_out is None or cache.attn_out.shape[1] != N:
-                cache.attn_out = x.new_zeros(B, N, C, dtype=attn_out.dtype)
-            if cache.attn_proj is None or cache.attn_proj.shape[1] != N:
-                cache.attn_proj = x.new_zeros(B, N, C, dtype=out.dtype)
-            if dynamic_idx.numel() > 0:
-                cache.attn_out.index_copy_(1, dynamic_idx, attn_out.detach())
-                cache.attn_proj.index_copy_(1, dynamic_idx, out.detach())
             if _debug_vit:
                 num_static = static_idx.numel()
                 num_dynamic = dynamic_idx.numel()
-                print(f"[ViT-Attn] block {cache_index} reuse (short seq): static={num_static} dynamic={num_dynamic}")
+                print(f"[ViT-Attn] block {cache_index} reuse (full KV): static={num_static} dynamic={num_dynamic}")
 
         else:
             # Full attention path
@@ -358,6 +370,7 @@ class Block(nn.Module):
                     cache_container=cache_container,
                     cache_index=cache_index,
                     cache_enabled=cache_enabled,
+                    static_reuse_enabled=getattr(parent, "_vla_static_reuse_enabled", True),
                 )
                 self.attn.set_cache_context(ctx)
             else:
@@ -376,8 +389,11 @@ class Block(nn.Module):
 
         x_attn = x + self.drop_path1(self.ls1(attn_proj))
 
+        static_reuse_enabled = getattr(parent, "_vla_static_reuse_enabled", True)
+
         if (
             cache_enabled
+            and static_reuse_enabled
             and cache is not None
             and cache.mlp_out is not None
             and cache.block_out is not None
@@ -828,6 +844,7 @@ class VisionTransformer(nn.Module):
         self._vla_cache_state: Optional[List[Optional[VitBlockCache]]] = [None] * depth
         self._vla_reuse_mask: Optional[torch.Tensor] = None
         self._vla_cache_enabled = False
+        self._vla_static_reuse_enabled = True
 
         self._vla_time_enabled = _time_vit
         self._vla_total_cuda_time = 0.0
@@ -879,11 +896,18 @@ class VisionTransformer(nn.Module):
         self.grad_checkpointing = enable
 
     @torch.jit.ignore
-    def set_vla_cache_state(self, cache_state: Optional[List[Optional[VitBlockCache]]], reuse_mask: Optional[torch.Tensor], enable_reuse: bool = True):
+    def set_vla_cache_state(
+            self,
+            cache_state: Optional[List[Optional[VitBlockCache]]],
+            reuse_mask: Optional[torch.Tensor],
+            enable_reuse: bool = True,
+            enable_static_reuse: bool = True,
+    ):
         """Set ViT-side cache and patch reuse mask for VLA-Cache inference."""
         self._vla_cache_state = cache_state if cache_state is not None else [None] * len(self.blocks)
         self._vla_reuse_mask = reuse_mask
         self._vla_cache_enabled = enable_reuse and reuse_mask is not None
+        self._vla_static_reuse_enabled = enable_static_reuse
 
     @torch.jit.ignore
     def get_vla_cache_state(self) -> Optional[List[Optional[VitBlockCache]]]:

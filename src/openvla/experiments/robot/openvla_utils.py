@@ -439,8 +439,18 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
                 reuse_mask_local[num_prefix + valid_idx] = True
             # Benchmark模式强制不复用缓存
             use_cache_payload = (cache_payload is not None and cfg.use_vit_cache and not cfg.vit_cache_benchmark)
-            cache_state = cache_payload if use_cache_payload else [None] * len(featurizer.blocks)
-            featurizer.set_vla_cache_state(cache_state, reuse_mask_local, enable_reuse=cfg.use_vit_cache)
+            if use_cache_payload:
+                cache_state = cache_payload
+            elif cfg.use_vit_cache:
+                cache_state = featurizer.get_vla_cache_state()
+            else:
+                cache_state = [None] * len(featurizer.blocks)
+            featurizer.set_vla_cache_state(
+                cache_state,
+                reuse_mask_local,
+                enable_reuse=cfg.use_vit_cache,
+                enable_static_reuse=getattr(cfg, "vit_cache_reuse", True),
+            )
             static_count = reuse_mask_local.sum().item()
             total_count = reuse_mask_local.numel()
             ratio = static_count / max(1, total_count)

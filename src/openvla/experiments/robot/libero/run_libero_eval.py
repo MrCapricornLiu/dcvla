@@ -60,6 +60,8 @@ class GenerateConfig:
     use_vla_cache: bool = True
     # Enable ViT-side KV cache reuse (static patch K/V)
     use_vit_cache: bool = False
+    # Control whether static reuse is applied (if False, only baseline k/v cache)
+    vit_cache_reuse: bool = True
     # Allow ViT cache to run even when LLM VLA-Cache is disabled
     vit_cache_standalone: bool = False
     # Benchmark mode always on: run ViT cache pipeline even when reuse is disabled
