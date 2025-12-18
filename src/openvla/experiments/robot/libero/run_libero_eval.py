@@ -62,6 +62,8 @@ class GenerateConfig:
     use_vit_cache: bool = False
     # Control whether static reuse is applied (if False, only baseline k/v cache)
     vit_cache_reuse: bool = True
+    # Keyframe interval for ViT cache (0 means disabled)
+    vit_cache_keyframe_interval: int = 0
     # Allow ViT cache to run even when LLM VLA-Cache is disabled
     vit_cache_standalone: bool = False
     # Benchmark mode always on: run ViT cache pipeline even when reuse is disabled

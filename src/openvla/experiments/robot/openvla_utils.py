@@ -450,6 +450,7 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
                 reuse_mask_local,
                 enable_reuse=cfg.use_vit_cache,
                 enable_static_reuse=getattr(cfg, "vit_cache_reuse", True),
+                keyframe_interval=getattr(cfg, "vit_cache_keyframe_interval", 0),
             )
             static_count = reuse_mask_local.sum().item()
             total_count = reuse_mask_local.numel()

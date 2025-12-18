@@ -87,6 +87,7 @@ class VitCacheContext:
             cache_index: Optional[int],
             cache_enabled: bool,
             static_reuse_enabled: bool,
+            force_keyframe: bool = False,
     ):
         self.reuse_mask = reuse_mask
         self.cache = cache
@@ -94,6 +95,7 @@ class VitCacheContext:
         self.cache_index = cache_index
         self.cache_enabled = cache_enabled
         self.static_reuse_enabled = static_reuse_enabled
+        self.force_keyframe = force_keyframe
 
 
 class Attention(nn.Module):
@@ -139,6 +141,7 @@ class Attention(nn.Module):
         cache_index = ctx.cache_index if ctx is not None else None
         cache_enabled = ctx.cache_enabled if ctx is not None else False
         static_reuse_enabled = ctx.static_reuse_enabled if ctx is not None else False
+        force_keyframe = ctx.force_keyframe if ctx is not None else False
 
         def _project_q(all_tokens: torch.Tensor) -> torch.Tensor:
             B_local, N_local, _ = all_tokens.shape
@@ -164,6 +167,7 @@ class Attention(nn.Module):
 
         use_reuse = (
             cache_enabled
+            and not force_keyframe
             and reuse_mask is not None
             and reuse_mask.numel() == N
             and cache_container is not None
@@ -351,8 +355,10 @@ class Block(nn.Module):
         timing = False
         parent_ref = getattr(self, "_vla_parent_ref", None)
         parent = parent_ref() if parent_ref is not None else None
+        force_keyframe = False
         if parent is not None:
             timing = parent._vla_time_enabled and x.is_cuda
+            force_keyframe = getattr(parent, "_vla_force_keyframe", False)
         if timing:
             attn_start = torch.cuda.Event(enable_timing=True)
             attn_end = torch.cuda.Event(enable_timing=True)
@@ -384,6 +390,7 @@ class Block(nn.Module):
                     cache_index=cache_index,
                     cache_enabled=cache_enabled,
                     static_reuse_enabled=getattr(parent, "_vla_static_reuse_enabled", True),
+                    force_keyframe=force_keyframe,
                 )
                 self.attn.set_cache_context(ctx)
             else:
@@ -920,6 +927,10 @@ class VisionTransformer(nn.Module):
         # Print every call by default; override via env if needed
         self._vla_profile_interval = int(os.environ.get("VLA_VIT_PROFILE_INTERVAL", 1))
         self._vla_profile_print = os.environ.get("VLA_VIT_PROFILE_PRINT", "1") == "1"
+        # Keyframe refresh (optional, overridable via setter)
+        self._vla_keyframe_interval = int(os.environ.get("VLA_VIT_KEYFRAME_INTERVAL", 0))
+        self._vla_frame_idx = 0
+        self._vla_force_keyframe = False
 
         for idx, blk in enumerate(self.blocks):
             blk._vla_parent_ref = weakref.ref(self)
@@ -966,12 +977,18 @@ class VisionTransformer(nn.Module):
             reuse_mask: Optional[torch.Tensor],
             enable_reuse: bool = True,
             enable_static_reuse: bool = True,
+            keyframe_interval: Optional[int] = None,
     ):
         """Set ViT-side cache and patch reuse mask for VLA-Cache inference."""
         self._vla_cache_state = cache_state if cache_state is not None else [None] * len(self.blocks)
         self._vla_reuse_mask = reuse_mask
         self._vla_cache_enabled = enable_reuse and reuse_mask is not None
         self._vla_static_reuse_enabled = enable_static_reuse
+        if keyframe_interval is not None:
+            self._vla_keyframe_interval = int(keyframe_interval)
+        # reset frame index when cache state is refreshed
+        self._vla_frame_idx = 0
+        self._vla_force_keyframe = False
 
     @torch.jit.ignore
     def get_vla_cache_state(self) -> Optional[List[Optional[VitBlockCache]]]:
@@ -1094,6 +1111,11 @@ class VisionTransformer(nn.Module):
             self._vla_core_step_cuda = 0.0
             self._vla_attn_step_cuda = 0.0
             self._vla_mlp_step_cuda = 0.0
+        # Keyframe handling
+        if self._vla_keyframe_interval > 0:
+            self._vla_force_keyframe = (self._vla_frame_idx % self._vla_keyframe_interval == 0)
+        else:
+            self._vla_force_keyframe = False
 
         # take last n blocks if n is an int, if in is a sequence, select by matching indices
         outputs = self._intermediate_layers(x, n)
@@ -1131,6 +1153,7 @@ class VisionTransformer(nn.Module):
                 if self._vla_profile_print and (self._vla_profile_interval <= 0 or (eff_steps % self._vla_profile_interval == 0)):
                     print(f"[ViT Profile] Current CUDA latency: {self._vla_core_step_cuda:.6f} ms (attn {self._vla_attn_step_cuda:.6f} ms, mlp {self._vla_mlp_step_cuda:.6f} ms) | Average CUDA latency: {avg_ms:.6f} ms (attn {avg_attn:.6f} ms, mlp {avg_mlp:.6f} ms), Average TFLOPs: {avg_tflops:.6f}")
 
+        self._vla_frame_idx += 1
         return result
 
     def forward_features(self, x):
@@ -1139,6 +1162,11 @@ class VisionTransformer(nn.Module):
             self._vla_core_step_cuda = 0.0
             self._vla_attn_step_cuda = 0.0
             self._vla_mlp_step_cuda = 0.0
+        # Keyframe handling
+        if self._vla_keyframe_interval > 0:
+            self._vla_force_keyframe = (self._vla_frame_idx % self._vla_keyframe_interval == 0)
+        else:
+            self._vla_force_keyframe = False
 
         x = self.patch_embed(x)
         x = self._pos_embed(x)
@@ -1161,6 +1189,7 @@ class VisionTransformer(nn.Module):
                 if self._vla_profile_print and (self._vla_profile_interval <= 0 or (eff_steps % self._vla_profile_interval == 0)):
                     print(f"[ViT Profile] Current CUDA latency: {self._vla_core_step_cuda:.6f} ms | Average CUDA latency: {avg_ms:.6f} ms, Average TFLOPs: {avg_tflops:.6f}")
 
+        self._vla_frame_idx += 1
         return x
 
     def forward_head(self, x, pre_logits: bool = False):
