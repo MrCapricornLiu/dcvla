@@ -200,7 +200,10 @@ class Attention(nn.Module):
 
             # Compute attention for dynamic queries over full KV (static + dynamic)
             if dynamic_idx.numel() > 0:
-                q_dyn = _project_q(x[:, dynamic_idx, :])
+                # Single qkv projection on dynamic slice to keep kernel count low
+                qkv_dyn = self.qkv(x[:, dynamic_idx, :]).reshape(B, dynamic_idx.numel(), 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+                q_dyn, k_dyn, v_dyn = qkv_dyn.unbind(0)
+                q_dyn, k_dyn = self.q_norm(q_dyn), self.k_norm(k_dyn)
                 if self.fused_attn:
                     out_dyn = F.scaled_dot_product_attention(
                         q_dyn, cache.k, cache.v,
@@ -213,17 +216,18 @@ class Attention(nn.Module):
                     attn = self.attn_drop(attn)
                     out_dyn = attn @ cache.v
                 attn_dyn = out_dyn.transpose(1, 2).reshape(B, dynamic_idx.numel(), C)
-                # Assemble full outputs with a single allocation; static slices reuse cache, dynamic slices freshly computed
-                attn_full = x.new_empty(B, N, C)
-                proj_full = x.new_empty(B, N, C)
-                if static_idx.numel() > 0 and cache.attn_out is not None and cache.attn_out.shape[1] == N:
-                    attn_full[:, static_idx, :] = cache.attn_out[:, static_idx, :]
-                if static_idx.numel() > 0 and cache.attn_proj is not None and cache.attn_proj.shape[1] == N:
-                    proj_full[:, static_idx, :] = cache.attn_proj[:, static_idx, :]
+                # Prepare/reuse buffers
+                if cache.attn_out is None or cache.attn_out.shape[1] != N:
+                    cache.attn_out = x.new_zeros(B, N, C)
+                if cache.attn_proj is None or cache.attn_proj.shape[1] != N:
+                    cache.attn_proj = x.new_zeros(B, N, C)
+                attn_full = cache.attn_out
+                proj_full = cache.attn_proj
+                # Static slices already in cache; dynamic slices freshly computed
                 attn_full.index_copy_(1, dynamic_idx, attn_dyn)
                 proj_dyn = self.proj(attn_dyn)
+                proj_dyn = self.proj_drop(proj_dyn)
                 proj_full.index_copy_(1, dynamic_idx, proj_dyn)
-                proj_full = self.proj_drop(proj_full)
 
                 cache.attn_out = attn_full.detach()
                 cache.attn_proj = proj_full.detach()
@@ -344,9 +348,18 @@ class Block(nn.Module):
     def forward(self, x):
         reuse_mask = None
         cache_enabled = False
-
+        timing = False
         parent_ref = getattr(self, "_vla_parent_ref", None)
         parent = parent_ref() if parent_ref is not None else None
+        if parent is not None:
+            timing = parent._vla_time_enabled and x.is_cuda
+        if timing:
+            attn_start = torch.cuda.Event(enable_timing=True)
+            attn_end = torch.cuda.Event(enable_timing=True)
+            mlp_start = torch.cuda.Event(enable_timing=True)
+            mlp_end = torch.cuda.Event(enable_timing=True)
+            attn_start.record()
+
         if parent is not None and getattr(parent, "_vla_cache_enabled", False):
             reuse_mask = getattr(parent, "_vla_reuse_mask", None)
             cache_container = getattr(parent, "_vla_cache_state", None)
@@ -381,13 +394,25 @@ class Block(nn.Module):
             self.attn.set_cache_context(None)
 
         x_norm = self.norm1(x)
+        if _debug_vit:
+            print(f"[ViT-Debug] grad_enabled={torch.is_grad_enabled()} inference_mode={torch.is_inference_mode_enabled()}")
         attn_proj, attn_pre = self.attn(x_norm)
+        if timing:
+            try:
+                attn_end.record()
+                torch.cuda.synchronize()
+                elapsed_attn = attn_start.elapsed_time(attn_end)
+                parent._vla_attn_step_cuda += elapsed_attn
+            except Exception:
+                pass
 
         # Refresh cache reference after attention may have lazily created/updated it
         if cache_enabled and cache_container is not None and cache_index is not None and cache_index < len(cache_container):
             cache = cache_container[cache_index]
 
         x_attn = x + self.drop_path1(self.ls1(attn_proj))
+        if timing:
+            mlp_start.record()
 
         static_reuse_enabled = getattr(parent, "_vla_static_reuse_enabled", True)
 
@@ -402,10 +427,23 @@ class Block(nn.Module):
         ):
             dynamic_idx = (~reuse_mask).nonzero(as_tuple=True)[0]
             if dynamic_idx.numel() == 0:
+                if timing:
+                    try:
+                        mlp_end.record()
+                        torch.cuda.synchronize()
+                        elapsed_mlp = mlp_start.elapsed_time(mlp_end)
+                        parent._vla_mlp_step_cuda += elapsed_mlp
+                    except Exception:
+                        pass
                 return cache.block_out.to(x.dtype)
 
-            mlp_full = cache.mlp_out.to(x.dtype)
-            x_out = torch.empty_like(cache.block_out, dtype=x.dtype)
+            # Reuse existing buffers; if missing, allocate once
+            if cache.mlp_out is None or cache.mlp_out.shape != (x.shape[0], x.shape[1], x.shape[2]):
+                cache.mlp_out = x.new_zeros(x.shape[0], x.shape[1], x.shape[2])
+            if cache.block_out is None or cache.block_out.shape != (x.shape[0], x.shape[1], x.shape[2]):
+                cache.block_out = x.new_zeros(x.shape[0], x.shape[1], x.shape[2])
+            mlp_full = cache.mlp_out
+            x_out = cache.block_out
 
             attn_proj_dyn = attn_proj[:, dynamic_idx, :]
             x_attn_dyn = x[:, dynamic_idx, :] + self.drop_path1(self.ls1(attn_proj_dyn))
@@ -420,10 +458,18 @@ class Block(nn.Module):
             if static_idx.numel() > 0:
                 x_out[:, static_idx, :] = cache.block_out[:, static_idx, :].to(x.dtype)
 
-            cache.mlp_out = mlp_full.detach()
-            cache.block_out = x_out.detach()
+            cache.mlp_out = mlp_full
+            cache.block_out = x_out
             if _debug_vit:
                 print(f"[ViT-MLP] block {cache_index} reuse fast path: static={reuse_mask.sum().item()} dynamic={dynamic_idx.numel()}")
+            if timing:
+                try:
+                    mlp_end.record()
+                    torch.cuda.synchronize()
+                    elapsed_mlp = mlp_start.elapsed_time(mlp_end)
+                    parent._vla_mlp_step_cuda += elapsed_mlp
+                except Exception:
+                    pass
             return x_out
 
         if cache_enabled and cache is not None and cache.mlp_out is not None and reuse_mask is not None and reuse_mask.numel() == x.shape[1]:
@@ -450,6 +496,14 @@ class Block(nn.Module):
 
             cache.mlp_out = mlp_full.detach()
             cache.block_out = x_out.detach()
+            if timing:
+                try:
+                    mlp_end.record()
+                    torch.cuda.synchronize()
+                    elapsed_mlp = mlp_start.elapsed_time(mlp_end)
+                    parent._vla_mlp_step_cuda += elapsed_mlp
+                except Exception:
+                    pass
             return x_out
         else:
             x_norm2 = self.norm2(x_attn)
@@ -466,8 +520,16 @@ class Block(nn.Module):
                         dtype=x.dtype,
                     )
                     cache_container[cache_index] = cache
-                cache.mlp_out = mlp_out.detach()
-                cache.block_out = x_out.detach()
+                cache.mlp_out = mlp_out
+                cache.block_out = x_out
+            if timing:
+                try:
+                    mlp_end.record()
+                    torch.cuda.synchronize()
+                    elapsed_mlp = mlp_start.elapsed_time(mlp_end)
+                    parent._vla_mlp_step_cuda += elapsed_mlp
+                except Exception:
+                    pass
             return x_out
 
 
@@ -847,9 +909,11 @@ class VisionTransformer(nn.Module):
         self._vla_static_reuse_enabled = True
 
         self._vla_time_enabled = _time_vit
-        self._vla_total_cuda_time = 0.0
-        self._vla_total_wall_time = 0.0
+        self._vla_total_cuda_time = 0.0  # per-block core timing (attn + mlp)
         self._vla_num_forward = 0
+        self._vla_core_step_cuda = 0.0
+        self._vla_attn_step_cuda = 0.0
+        self._vla_mlp_step_cuda = 0.0
         self._vla_total_flops = 0.0
         self._vla_last_flops = 0.0
         self._vla_profile_warmup = int(os.environ.get("VLA_VIT_PROFILE_WARMUP", 20))
@@ -1027,11 +1091,9 @@ class VisionTransformer(nn.Module):
         """
         timing = self._vla_time_enabled and x.device.type == "cuda"
         if timing:
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            wall_start = time.time()
-            torch.cuda.synchronize()
-            start_event.record()
+            self._vla_core_step_cuda = 0.0
+            self._vla_attn_step_cuda = 0.0
+            self._vla_mlp_step_cuda = 0.0
 
         # take last n blocks if n is an int, if in is a sequence, select by matching indices
         outputs = self._intermediate_layers(x, n)
@@ -1052,25 +1114,32 @@ class VisionTransformer(nn.Module):
         result = tuple(outputs)
 
         if timing:
-            end_event.record()
-            torch.cuda.synchronize()
-            elapsed_ms = start_event.elapsed_time(end_event)
-            wall_ms = (time.time() - wall_start) * 1000.0
             self._vla_num_forward += 1
             if self._vla_num_forward > self._vla_profile_warmup:
                 self._vla_total_flops += getattr(self, "_vla_last_flops", 0.0)
-                self._vla_total_cuda_time += elapsed_ms
-                self._vla_total_wall_time += wall_ms
+                # Core CUDA time累计为 attn + mlp
+                self._vla_core_step_cuda = self._vla_attn_step_cuda + self._vla_mlp_step_cuda
+                self._vla_total_cuda_time += self._vla_core_step_cuda
+                # 分别累加 attn/mlp，便于统计平均
+                self._vla_total_attn_time = getattr(self, "_vla_total_attn_time", 0.0) + self._vla_attn_step_cuda
+                self._vla_total_mlp_time = getattr(self, "_vla_total_mlp_time", 0.0) + self._vla_mlp_step_cuda
                 eff_steps = max(1, self._vla_num_forward - self._vla_profile_warmup)
                 avg_ms = self._vla_total_cuda_time / eff_steps
-                avg_wall = self._vla_total_wall_time / eff_steps
+                avg_attn = self._vla_total_attn_time / eff_steps
+                avg_mlp = self._vla_total_mlp_time / eff_steps
                 avg_tflops = (self._vla_total_flops / eff_steps) * 1e-12
                 if self._vla_profile_print and (self._vla_profile_interval <= 0 or (eff_steps % self._vla_profile_interval == 0)):
-                    print(f"[ViT Profile] Current CUDA latency: {elapsed_ms:.6f} ms (wall {wall_ms:.6f} ms) | Average CUDA latency: {avg_ms:.6f} ms, Average wall: {avg_wall:.6f} ms, Average TFLOPs: {avg_tflops:.6f}")
+                    print(f"[ViT Profile] Current CUDA latency: {self._vla_core_step_cuda:.6f} ms (attn {self._vla_attn_step_cuda:.6f} ms, mlp {self._vla_mlp_step_cuda:.6f} ms) | Average CUDA latency: {avg_ms:.6f} ms (attn {avg_attn:.6f} ms, mlp {avg_mlp:.6f} ms), Average TFLOPs: {avg_tflops:.6f}")
 
         return result
 
     def forward_features(self, x):
+        # Reset per-forward core timers
+        if self._vla_time_enabled and x.device.type == "cuda":
+            self._vla_core_step_cuda = 0.0
+            self._vla_attn_step_cuda = 0.0
+            self._vla_mlp_step_cuda = 0.0
+
         x = self.patch_embed(x)
         x = self._pos_embed(x)
         x = self.patch_drop(x)
@@ -1080,6 +1149,18 @@ class VisionTransformer(nn.Module):
         else:
             x = self.blocks(x)
         x = self.norm(x)
+
+        if self._vla_time_enabled and x.device.type == "cuda":
+            self._vla_num_forward += 1
+            if self._vla_num_forward > self._vla_profile_warmup:
+                self._vla_total_flops += getattr(self, "_vla_last_flops", 0.0)
+                self._vla_total_cuda_time += self._vla_core_step_cuda
+                eff_steps = max(1, self._vla_num_forward - self._vla_profile_warmup)
+                avg_ms = self._vla_total_cuda_time / eff_steps
+                avg_tflops = (self._vla_total_flops / eff_steps) * 1e-12
+                if self._vla_profile_print and (self._vla_profile_interval <= 0 or (eff_steps % self._vla_profile_interval == 0)):
+                    print(f"[ViT Profile] Current CUDA latency: {self._vla_core_step_cuda:.6f} ms | Average CUDA latency: {avg_ms:.6f} ms, Average TFLOPs: {avg_tflops:.6f}")
+
         return x
 
     def forward_head(self, x, pre_logits: bool = False):
