@@ -383,6 +383,11 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
     prev_attn = last_caches['attentions'] if last_caches is not None else None
     mask_indices = None
     vla.language_model.config.proportion_attn_var = None
+    drop_indices = last_caches.get('drop_indices') if last_caches is not None else None
+    vision_keep_mask = None
+    drop_count = 0
+    overlap_count = 0
+    static_count = 0
 
 
     # (If trained with image augmentations) Center crop image and then resize back up to original size.
@@ -405,18 +410,67 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
         if prompt_cache is not None or cfg.vit_cache_standalone or cfg.vit_cache_benchmark:
             stable_patches = find_static_patches(image, prev_image, top_k=130)
 
-        if prev_attn is not None:
-            result_image, remaining_static_tokens_indices = task_relevant_selection(
-                prev_attn, image, stable_patches
-            )
-            mask_indices = torch.tensor(remaining_static_tokens_indices, device=DEVICE) if remaining_static_tokens_indices else None
+            if prev_attn is not None:
+                result_image, remaining_static_tokens_indices, only_significant, only_top, overlap, top_patches = task_relevant_selection(
+                    prev_attn, image, stable_patches
+                )
+                mask_indices = torch.tensor(remaining_static_tokens_indices, device=DEVICE) if remaining_static_tokens_indices else None
+                # Stats
+                static_count = len(stable_patches) if stable_patches is not None else 0
+                drop_count = len(only_significant) if only_significant is not None else 0
+                overlap_count = len(overlap) if overlap is not None else 0
 
-            if cfg.use_vla_cache:
-                vla.language_model.config.reusable_patches = mask_indices
+                # Select a fixed drop set (static & low-attention) at keyframe
+                if cfg.vit_cache_drop_k > 0 and only_significant:
+                    drop_list = sorted(list(only_significant))
+                    drop_list = drop_list[: cfg.vit_cache_drop_k]
+                    drop_indices = torch.tensor(drop_list, device=DEVICE, dtype=torch.long)
+            else:
+                # No attention => no task filtering; keep previous drop_indices
+                mask_indices = None
+
+            # Build keep mask (drop static, low-attention patches). Length = num_patches (no prefix)
+            num_patches = vla.vision_backbone.featurizer.patch_embed.num_patches
+            if drop_indices is not None and drop_indices.numel() > 0:
+                vision_keep_mask = torch.ones(num_patches, device=DEVICE, dtype=torch.bool)
+                valid_drop = drop_indices[drop_indices < num_patches]
+                if valid_drop.numel() > 0:
+                    vision_keep_mask[valid_drop] = False
+
+            # Map static reusable patch ids onto compacted indices after pruning
+            mapped_mask_indices = None
+            if mask_indices is not None:
+                # mask_indices currently 1-based (see task_relevant_selection)
+                if vision_keep_mask is None:
+                    mapped_mask_indices = mask_indices
+                else:
+                    keep_idx = torch.nonzero(vision_keep_mask, as_tuple=False).squeeze(-1)
+                    if keep_idx.numel() > 0:
+                        mapped = []
+                        # Convert each reusable patch to its new position (still 1-based after BOS)
+                        for pid in mask_indices.tolist():
+                            orig = pid - 1  # convert to 0-based patch id
+                            if orig < 0 or orig >= vision_keep_mask.numel():
+                                continue
+                            if not vision_keep_mask[orig]:
+                                continue
+                            hit = (keep_idx == orig).nonzero(as_tuple=False)
+                            if hit.numel() > 0:
+                                mapped.append(int(hit.item()) + 1)
+                        if mapped:
+                            mapped_mask_indices = torch.tensor(mapped, device=DEVICE, dtype=mask_indices.dtype)
+            if cfg.use_vla_cache and mapped_mask_indices is not None and mapped_mask_indices.numel() > 0:
+                vla.language_model.config.reusable_patches = mapped_mask_indices
                 vla.language_model.config.proportion_attn_var = get_layer_mask_schedule(prev_attn)
+            else:
+                vla.language_model.config.reusable_patches = None
+                vla.language_model.config.proportion_attn_var = None
 
         if not cfg.use_vla_cache:
             # honor flag: do not reuse LLaMA cache when VLA-Cache is off
+            prompt_cache = None
+        # If we prune vision tokens, stale past_key_values may misalign; force refresh
+        if vision_keep_mask is not None:
             prompt_cache = None
 
     else:
@@ -452,10 +506,17 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
                 enable_static_reuse=getattr(cfg, "vit_cache_reuse", True),
                 keyframe_interval=getattr(cfg, "vit_cache_keyframe_interval", 0),
             )
-            static_count = reuse_mask_local.sum().item()
+            static_total = reuse_mask_local.sum().item()
             total_count = reuse_mask_local.numel()
-            ratio = static_count / max(1, total_count)
-            print(f"[ViT Reuse] static={static_count}/{total_count} ({ratio:.3f})")
+            ratio_static = static_total / max(1, total_count)
+            # Breakdown: drop vs reuse vs dynamic (patch部分，不含prefix)
+            num_patches_local = num_patches
+            static_patch_mask = reuse_mask_local[num_prefix : num_prefix + num_patches_local]
+            num_static_patch = static_patch_mask.sum().item()
+            num_drop = min(drop_count, num_patches_local) if drop_indices is not None else 0
+            num_reuse = max(num_static_patch - num_drop, 0)
+            num_dynamic = num_patches_local - num_static_patch
+            print(f"[ViT Reuse] total={total_count} static={static_total} ({ratio_static:.3f}) | drop={num_drop} reuse={num_reuse} dynamic={num_dynamic}")
             if DEBUG_VIT:
                 print(f"[ViT-Setup] mask_len={reuse_mask_local.numel()} static={reuse_mask_local.sum().item()} num_prefix={num_prefix} num_patches={num_patches}")
             return reuse_mask_local
@@ -470,6 +531,8 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
                 None if vit_cache is None else vit_cache.get("beta"),
                 mask_indices,
             )
+        # Save drop_indices into caches for next step
+        vit_cache_out = {"alpha": None, "beta": None, "drop_indices": drop_indices}
     else:
         # Ensure stale cache not reused
         if hasattr(vla.vision_backbone.featurizer, "reset_vla_cache"):
@@ -477,6 +540,7 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
         if getattr(vla.vision_backbone, "use_fused_vision_backbone", False):
             if hasattr(vla.vision_backbone.fused_featurizer, "reset_vla_cache"):
                 vla.vision_backbone.fused_featurizer.reset_vla_cache()
+        vit_cache_out = None
 
     if prompt_cache is None:
         prompt_cache = DynamicCache()
@@ -491,6 +555,8 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
 
     # Process inputs.
     inputs = processor(prompt, image).to(DEVICE, dtype=torch.bfloat16)
+    if vision_keep_mask is not None:
+        inputs["vision_keep_mask"] = vision_keep_mask
 
     # Get action.
     action, last_caches = vla.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=False, return_dict_in_generate=True, 
@@ -498,7 +564,8 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
     # Collect ViT cache for next frame
     if cfg.use_vit_cache and not cfg.vit_cache_benchmark:
         vit_cache_out = {
-            "alpha": vla.vision_backbone.featurizer.get_vla_cache_state()
+            "alpha": vla.vision_backbone.featurizer.get_vla_cache_state(),
+            "drop_indices": drop_indices,
         }
         if getattr(vla.vision_backbone, "use_fused_vision_backbone", False):
             vit_cache_out["beta"] = vla.vision_backbone.fused_featurizer.get_vla_cache_state()

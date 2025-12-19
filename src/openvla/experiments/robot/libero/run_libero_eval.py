@@ -64,6 +64,8 @@ class GenerateConfig:
     vit_cache_reuse: bool = True
     # Keyframe interval for ViT cache (0 means disabled)
     vit_cache_keyframe_interval: int = 0
+    # Number of lowest-importance static patches to drop (0 disables dropping)
+    vit_cache_drop_k: int = 0
     # Allow ViT cache to run even when LLM VLA-Cache is disabled
     vit_cache_standalone: bool = False
     # Benchmark mode always on: run ViT cache pipeline even when reuse is disabled

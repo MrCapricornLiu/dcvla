@@ -294,6 +294,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.FloatTensor] = None,
+        vision_keep_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -380,6 +381,14 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             # Get Input Embeddings (from Language Model Embeddings)
             input_embeddings = self.get_input_embeddings()(input_ids)
 
+            # Optional vision pruning: apply keep mask on patch dim (excluding prefix)
+            if vision_keep_mask is not None:
+                # vision_keep_mask is over patch tokens (no prefix), length = num_patches
+                keep = vision_keep_mask.to(projected_patch_embeddings.device)
+                projected_patch_embeddings = projected_patch_embeddings[:, keep, :]
+                if projected_patch_attention_mask is not None:
+                    projected_patch_attention_mask = projected_patch_attention_mask[:, keep]
+
             # Build Multimodal Embeddings & Attention Mask =>> Prismatic defaults to inserting after <BOS> token (1:)
             multimodal_embeddings = torch.cat(
                 [input_embeddings[:, :1, :], projected_patch_embeddings, input_embeddings[:, 1:, :]], dim=1
@@ -455,6 +464,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         pixel_values: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        vision_keep_mask: Optional[torch.Tensor] = None,
         **kwargs: str,
     ) -> Dict[str, torch.Tensor]:
         """Borrowed from `LlamaForCausalLM` and simplified for batch size = 1; mirrors original PrismaticVLM logic."""
@@ -481,6 +491,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                 "pixel_values": pixel_values,
                 "past_key_values": past_key_values,
                 "use_cache": kwargs.get("use_cache"),
+                "vision_keep_mask": vision_keep_mask,
             }
         )
 
@@ -506,7 +517,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         self.vocab_size = self.config.text_config.vocab_size - self.config.pad_to_multiple_of
 
     def predict_action(
-        self, input_ids: Optional[torch.LongTensor] = None, unnorm_key: Optional[str] = None, **kwargs: str
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        unnorm_key: Optional[str] = None,
+        vision_keep_mask: Optional[torch.Tensor] = None,
+        **kwargs: str,
     ) -> np.ndarray:
         """Thin wrapper around .generate() that decodes predicted actions and unnormalizes them."""
         # If the special empty token ('') does not already appear after the colon (':') token in the prompt
@@ -517,6 +532,9 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             )
 
         # Run VLA inference
+        if vision_keep_mask is not None:
+            kwargs["vision_keep_mask"] = vision_keep_mask
+
         results = self.generate(input_ids, max_new_tokens=self.get_action_dim(unnorm_key), **kwargs)
         attentions = results.attentions
         past_key_values = results.past_key_values

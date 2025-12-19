@@ -172,4 +172,4 @@ def task_relevant_selection(multihead_attention, image, significant_patches, top
     v_token_start = 1
     remaining = sorted([pid + v_token_start for pid in only_significant])
 
-    return np.array(result_image), remaining
+    return np.array(result_image), remaining, only_significant, only_top, overlap, top_patches
