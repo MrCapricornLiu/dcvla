@@ -62,12 +62,25 @@ class GenerateConfig:
     use_vit_cache: bool = False
     # Control whether static reuse is applied (if False, only baseline k/v cache)
     vit_cache_reuse: bool = True
-    # Keyframe interval for ViT cache (0 means disabled)
-    vit_cache_keyframe_interval: int = 0
     # Allow ViT cache to run even when LLM VLA-Cache is disabled
     vit_cache_standalone: bool = False
     # Benchmark mode always on: run ViT cache pipeline even when reuse is disabled
     vit_cache_benchmark: bool = True
+    # Keyframe interval for ViT cache (0 means disabled)
+    vit_cache_keyframe_interval: int = 0
+    # Patch similarity metric for static detection: cosine | gray_diff | rgb_diff
+    vit_cache_patch_metric: str = "cosine"
+    # Pixel-diff threshold (0-1 after normalization); used by gray_diff/rgb_diff (fallback)
+    vit_cache_patch_diff_threshold: float = 0.1
+    # Metric-specific defaults (0-1 after normalization)
+    vit_cache_gray_diff_threshold: float = 0.1
+    vit_cache_rgb_diff_threshold: float = 0.05
+    # Cosine similarity threshold
+    vit_cache_sim_threshold: float = 0.996
+    # Attention top-k for task-relevance filtering
+    vit_cache_attention_top_k: int = 120
+    # Static token top-k for temporal selection
+    vit_cache_static_top_k: int = 130
     
     #################################################################################################################
     # Model-specific parameters

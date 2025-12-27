@@ -403,11 +403,37 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
 
         stable_patches = None
         if prompt_cache is not None or cfg.vit_cache_standalone or cfg.vit_cache_benchmark:
-            stable_patches = find_static_patches(image, prev_image, top_k=130)
+            patch_metric = getattr(cfg, "vit_cache_patch_metric", "cosine")
+            def _get_thresholds(role: str):
+                if patch_metric == "gray_diff":
+                    diff_thr = getattr(
+                        cfg, "vit_cache_gray_diff_threshold", getattr(cfg, "vit_cache_patch_diff_threshold", 0.1)
+                    )
+                    return None, diff_thr
+                if patch_metric == "rgb_diff":
+                    diff_thr = getattr(
+                        cfg, "vit_cache_rgb_diff_threshold", getattr(cfg, "vit_cache_patch_diff_threshold", 0.1)
+                    )
+                    return None, diff_thr
+                sim_thr = getattr(cfg, "vit_cache_sim_threshold", 0.996)
+                return sim_thr, getattr(cfg, "vit_cache_patch_diff_threshold", 0.1)
+
+            sim_thr, diff_thr = _get_thresholds("vit")
+            stable_patches = find_static_patches(
+                image,
+                prev_image,
+                top_k=getattr(cfg, "vit_cache_static_top_k", 130),
+                metric=patch_metric,
+                sim_threshold=sim_thr if sim_thr is not None else 0.996,
+                diff_threshold=diff_thr,
+            )
 
         if prev_attn is not None:
             result_image, remaining_static_tokens_indices = task_relevant_selection(
-                prev_attn, image, stable_patches
+                prev_attn,
+                image,
+                stable_patches,
+                top_k=getattr(cfg, "vit_cache_attention_top_k", 120),
             )
             mask_indices = torch.tensor(remaining_static_tokens_indices, device=DEVICE) if remaining_static_tokens_indices else None
 
@@ -461,7 +487,11 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
             return reuse_mask_local
 
         # Primary featurizer
-        reuse_mask_full = _prepare_featurizer(vla.vision_backbone.featurizer, None if vit_cache is None else vit_cache.get("alpha"), mask_indices)
+        reuse_mask_full = _prepare_featurizer(
+            vla.vision_backbone.featurizer,
+            None if vit_cache is None else vit_cache.get("alpha"),
+            mask_indices,
+        )
 
         # Fused backbone (if exists) uses同样的缓存/掩码策略
         if getattr(vla.vision_backbone, "use_fused_vision_backbone", False):

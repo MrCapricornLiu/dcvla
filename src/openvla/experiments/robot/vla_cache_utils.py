@@ -72,22 +72,82 @@ def calculate_patch_similarity(patches1, patches2):
     cosine_sim = dot / (norm1 * norm2 + 1e-8)
     return cosine_sim
 
-def find_static_patches(img_0, img_1, patch_size=14, top_k=150, sim_threshold=0.996):
+
+def calculate_patch_diff_gray(patches1, patches2):
+    """
+    Computes mean absolute grayscale difference per patch (0-1 scale).
+    """
+    p1 = patches1.astype(np.float32) / 255.0
+    p2 = patches2.astype(np.float32) / 255.0
+    if p1.ndim == 4:
+        weights = np.array([0.2989, 0.5870, 0.1140], dtype=np.float32)
+        gray1 = np.tensordot(p1, weights, axes=([-1], [0]))
+        gray2 = np.tensordot(p2, weights, axes=([-1], [0]))
+    else:
+        gray1 = p1
+        gray2 = p2
+    diff = np.abs(gray1 - gray2)
+    return diff.mean(axis=(-1, -2))
+
+
+def calculate_patch_diff_rgb(patches1, patches2):
+    """
+    Computes mean absolute RGB difference per patch (0-1 scale).
+    """
+    p1 = patches1.astype(np.float32) / 255.0
+    p2 = patches2.astype(np.float32) / 255.0
+    diff = np.abs(p1 - p2)
+    return diff.mean(axis=(1, 2, 3))
+
+def find_static_patches(
+    img_0,
+    img_1,
+    patch_size=14,
+    top_k=150,
+    sim_threshold=0.996,
+    metric="cosine",
+    diff_threshold=0.03,
+):
     """
     Identifies significant patches with high similarity across two images.
     """
     patches1 = patchify(img_0, patch_size)
     patches2 = patchify(img_1, patch_size)
 
-    similarity = calculate_patch_similarity(patches1, patches2)
     grid_size = 224 // patch_size
-    similarity_2d = similarity.reshape(grid_size, grid_size)
+    metric = metric.lower()
 
-    patch_scores = [(i * grid_size + j, similarity_2d[i, j])
-                    for i in range(grid_size) for j in range(grid_size)
-                    if similarity_2d[i, j] >= sim_threshold]
+    if metric == "cosine":
+        similarity = calculate_patch_similarity(patches1, patches2)
+        similarity_2d = similarity.reshape(grid_size, grid_size)
+        patch_scores = [
+            (i * grid_size + j, similarity_2d[i, j])
+            for i in range(grid_size)
+            for j in range(grid_size)
+            if similarity_2d[i, j] >= sim_threshold
+        ]
+        patch_scores.sort(key=lambda x: x[1], reverse=True)
+    elif metric == "gray_diff":
+        diff = calculate_patch_diff_gray(patches1, patches2).reshape(grid_size, grid_size)
+        patch_scores = [
+            (i * grid_size + j, diff[i, j])
+            for i in range(grid_size)
+            for j in range(grid_size)
+            if diff[i, j] <= diff_threshold
+        ]
+        patch_scores.sort(key=lambda x: x[1])
+    elif metric == "rgb_diff":
+        diff = calculate_patch_diff_rgb(patches1, patches2).reshape(grid_size, grid_size)
+        patch_scores = [
+            (i * grid_size + j, diff[i, j])
+            for i in range(grid_size)
+            for j in range(grid_size)
+            if diff[i, j] <= diff_threshold
+        ]
+        patch_scores.sort(key=lambda x: x[1])
+    else:
+        raise ValueError(f"Unknown patch metric: {metric}")
 
-    patch_scores.sort(key=lambda x: x[1], reverse=True)
     top_patch_ids = [idx for idx, _ in patch_scores[:top_k]]
     return top_patch_ids
 
