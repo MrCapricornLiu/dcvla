@@ -81,6 +81,14 @@ class GenerateConfig:
     vit_cache_attention_top_k: int = 120
     # Static token top-k for temporal selection
     vit_cache_static_top_k: int = 130
+    # Optional: LLM-side mask parameters (fallback to vit_cache_* when None)
+    llm_cache_patch_metric: Optional[str] = None
+    llm_cache_patch_diff_threshold: Optional[float] = None
+    llm_cache_gray_diff_threshold: Optional[float] = None
+    llm_cache_rgb_diff_threshold: Optional[float] = None
+    llm_cache_sim_threshold: Optional[float] = None
+    llm_cache_attention_top_k: Optional[int] = None
+    llm_cache_static_top_k: Optional[int] = None
     
     #################################################################################################################
     # Model-specific parameters

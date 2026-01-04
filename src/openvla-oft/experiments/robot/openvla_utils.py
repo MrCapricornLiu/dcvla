@@ -769,8 +769,8 @@ def get_vla_action(
     prev_attn = last_caches["attentions"] if last_caches is not None else None
     vit_cache = last_caches.get("vit_cache") if last_caches is not None else None
 
-    mask_indices = None
     mask_indices_vit = None
+    mask_indices_llm = None
     remaining_static_tokens_primary = []
     remaining_static_tokens_wrist = []
     vla.language_model.config.proportion_attn_var = None
@@ -783,87 +783,157 @@ def get_vla_action(
             mode_msg = ">> ViT benchmark + VLA on" if cfg.use_vla_cache else ">> ViT benchmark + VLA off"
         print(mode_msg)
 
-        stable_patches_primary = None
-        stable_patches_wrist = None
-        if prompt_cache is not None or cfg.vit_cache_standalone or cfg.vit_cache_benchmark:
-            patch_metric = getattr(cfg, "vit_cache_patch_metric", "cosine")
+        stable_patches_primary_vit = None
+        stable_patches_wrist_vit = None
+        stable_patches_primary_llm = None
+        stable_patches_wrist_llm = None
+        if prompt_cache is not None or cfg.vit_cache_standalone or cfg.vit_cache_benchmark or cfg.use_vla_cache:
+            def _resolve_llm_param(name: str, default):
+                val = getattr(cfg, f"llm_cache_{name}", None)
+                return default if val is None else val
 
-            def _get_thresholds(role: str):
-                if patch_metric == "gray_diff":
-                    diff_thr = getattr(
-                        cfg, "vit_cache_gray_diff_threshold", getattr(cfg, "vit_cache_patch_diff_threshold", 0.1)
-                    )
-                    return None, diff_thr
-                if patch_metric == "rgb_diff":
-                    diff_thr = getattr(
-                        cfg, "vit_cache_rgb_diff_threshold", getattr(cfg, "vit_cache_patch_diff_threshold", 0.1)
-                    )
-                    return None, diff_thr
-                sim_thr = getattr(cfg, "vit_cache_sim_threshold", 0.996)
-                return sim_thr, getattr(cfg, "vit_cache_patch_diff_threshold", 0.1)
+            vit_metric = getattr(cfg, "vit_cache_patch_metric", "cosine")
+            llm_metric = _resolve_llm_param("patch_metric", vit_metric)
 
-            sim_thr, diff_thr = _get_thresholds("vit")
-            stable_patches_primary = find_static_patches(
+            vit_sim = getattr(cfg, "vit_cache_sim_threshold", 0.996)
+            vit_diff = getattr(cfg, "vit_cache_patch_diff_threshold", 0.1)
+            vit_gray = getattr(cfg, "vit_cache_gray_diff_threshold", vit_diff)
+            vit_rgb = getattr(cfg, "vit_cache_rgb_diff_threshold", vit_diff)
+
+            llm_sim = _resolve_llm_param("sim_threshold", vit_sim)
+            llm_diff = _resolve_llm_param("patch_diff_threshold", vit_diff)
+            llm_gray = _resolve_llm_param("gray_diff_threshold", vit_gray)
+            llm_rgb = _resolve_llm_param("rgb_diff_threshold", vit_rgb)
+
+            vit_static_top_k = getattr(cfg, "vit_cache_static_top_k", 130)
+            llm_static_top_k = _resolve_llm_param("static_top_k", vit_static_top_k)
+
+            def _get_thresholds(metric, sim_thr, gray_thr, rgb_thr, diff_thr):
+                if metric == "gray_diff":
+                    return None, gray_thr if gray_thr is not None else diff_thr
+                if metric == "rgb_diff":
+                    return None, rgb_thr if rgb_thr is not None else diff_thr
+                return sim_thr, diff_thr
+
+            vit_sim_thr, vit_diff_thr = _get_thresholds(vit_metric, vit_sim, vit_gray, vit_rgb, vit_diff)
+            llm_sim_thr, llm_diff_thr = _get_thresholds(llm_metric, llm_sim, llm_gray, llm_rgb, llm_diff)
+
+            stable_patches_primary_vit = find_static_patches(
                 all_images[0],
                 prev_images[0],
-                top_k=getattr(cfg, "vit_cache_static_top_k", 130),
-                metric=patch_metric,
-                sim_threshold=sim_thr if sim_thr is not None else 0.996,
-                diff_threshold=diff_thr,
+                top_k=vit_static_top_k,
+                metric=vit_metric,
+                sim_threshold=vit_sim_thr if vit_sim_thr is not None else 0.996,
+                diff_threshold=vit_diff_thr,
+            )
+            stable_patches_primary_llm = find_static_patches(
+                all_images[0],
+                prev_images[0],
+                top_k=llm_static_top_k,
+                metric=llm_metric,
+                sim_threshold=llm_sim_thr if llm_sim_thr is not None else 0.996,
+                diff_threshold=llm_diff_thr,
             )
             if len(all_images) > 1 and len(prev_images) > 1:
-                stable_patches_wrist = find_static_patches(
+                stable_patches_wrist_vit = find_static_patches(
                     all_images[1],
                     prev_images[1],
-                    top_k=getattr(cfg, "vit_cache_static_top_k", 130),
-                    metric=patch_metric,
-                    sim_threshold=sim_thr if sim_thr is not None else 0.996,
-                    diff_threshold=diff_thr,
+                    top_k=vit_static_top_k,
+                    metric=vit_metric,
+                    sim_threshold=vit_sim_thr if vit_sim_thr is not None else 0.996,
+                    diff_threshold=vit_diff_thr,
+                )
+                stable_patches_wrist_llm = find_static_patches(
+                    all_images[1],
+                    prev_images[1],
+                    top_k=llm_static_top_k,
+                    metric=llm_metric,
+                    sim_threshold=llm_sim_thr if llm_sim_thr is not None else 0.996,
+                    diff_threshold=llm_diff_thr,
                 )
 
         # Step 2: Use prior attention to filter out task-relevant tokens
         if prev_attn is not None:
-            if stable_patches_primary is None:
-                stable_patches_primary = []
-            if stable_patches_wrist is None:
-                stable_patches_wrist = []
+            if stable_patches_primary_vit is None:
+                stable_patches_primary_vit = []
+            if stable_patches_wrist_vit is None:
+                stable_patches_wrist_vit = []
+            if stable_patches_primary_llm is None:
+                stable_patches_primary_llm = []
+            if stable_patches_wrist_llm is None:
+                stable_patches_wrist_llm = []
 
-            vis_primary, remaining_static_tokens_primary = task_relevant_selection(
+            vit_attn_top_k = getattr(cfg, "vit_cache_attention_top_k", 120)
+            llm_attn_top_k = _resolve_llm_param("attention_top_k", vit_attn_top_k)
+
+            vis_primary, remaining_static_tokens_primary_vit = task_relevant_selection(
                 prev_attn,
                 result_image[0],
-                stable_patches_primary,
+                stable_patches_primary_vit,
                 primary=True,
-                top_k=getattr(cfg, "vit_cache_attention_top_k", 120),
+                top_k=vit_attn_top_k,
+            )
+            _, remaining_static_tokens_primary_llm = task_relevant_selection(
+                prev_attn,
+                result_image[0],
+                stable_patches_primary_llm,
+                primary=True,
+                top_k=llm_attn_top_k,
             )
             if len(result_image) > 1:
-                vis_wrist, remaining_static_tokens_wrist = task_relevant_selection(
+                vis_wrist, remaining_static_tokens_wrist_vit = task_relevant_selection(
                     prev_attn,
                     result_image[1],
-                    stable_patches_wrist,
+                    stable_patches_wrist_vit,
                     primary=False,
-                    top_k=getattr(cfg, "vit_cache_attention_top_k", 120),
+                    top_k=vit_attn_top_k,
+                )
+                _, remaining_static_tokens_wrist_llm = task_relevant_selection(
+                    prev_attn,
+                    result_image[1],
+                    stable_patches_wrist_llm,
+                    primary=False,
+                    top_k=llm_attn_top_k,
                 )
                 result_image = [vis_primary, vis_wrist]
             else:
+                remaining_static_tokens_wrist_vit = []
+                remaining_static_tokens_wrist_llm = []
                 result_image = [vis_primary]
 
-            # Merge remaining static token indices and update model config
-            final_static_token_indices = remaining_static_tokens_primary + remaining_static_tokens_wrist
-            mask_indices = torch.tensor(final_static_token_indices, device=DEVICE) if final_static_token_indices else None
+            final_static_token_indices_vit = (
+                remaining_static_tokens_primary_vit + remaining_static_tokens_wrist_vit
+            )
+            final_static_token_indices_llm = (
+                remaining_static_tokens_primary_llm + remaining_static_tokens_wrist_llm
+            )
+            # Keep vit lists for downstream reuse mapping
+            remaining_static_tokens_primary = remaining_static_tokens_primary_vit
+            remaining_static_tokens_wrist = remaining_static_tokens_wrist_vit
+            mask_indices_vit = (
+                torch.tensor(final_static_token_indices_vit, device=DEVICE)
+                if final_static_token_indices_vit
+                else None
+            )
+            mask_indices_llm = (
+                torch.tensor(final_static_token_indices_llm, device=DEVICE)
+                if final_static_token_indices_llm
+                else None
+            )
 
             if cfg.use_vla_cache:
-                vla.language_model.config.reusable_patches = mask_indices
+                vla.language_model.config.reusable_patches = mask_indices_llm
                 vla.language_model.config.proportion_attn_var = get_layer_mask_schedule(prev_attn)
 
         if not cfg.use_vla_cache:
             # honor flag: do not reuse LLaMA cache when VLA-Cache is off
             prompt_cache = None
-            mask_indices = None
+            mask_indices_llm = None
 
     else:
         print(">> VLA-Cache disabled")
         prompt_cache = None
-        mask_indices = None
+        mask_indices_llm = None
 
     if prompt_cache is None:
         prompt_cache = DynamicCache()
@@ -999,8 +1069,8 @@ def get_vla_action(
     end_time = time.time()
     time_elapsed = end_time - start_time
     metrics.update({"time_elapsed": time_elapsed})
-    metrics.update({"num_static_tokens_primary": len(remaining_static_tokens_primary) if mask_indices is not None else 0})
-    metrics.update({"num_static_tokens_wrist": len(remaining_static_tokens_wrist) if mask_indices is not None else 0})
+    metrics.update({"num_static_tokens_primary": len(remaining_static_tokens_primary) if mask_indices_vit is not None else 0})
+    metrics.update({"num_static_tokens_wrist": len(remaining_static_tokens_wrist) if mask_indices_vit is not None else 0})
     
     # Extract subset of actions for open loop steps
     action_list = [action[i] for i in range(min(len(action), cfg.num_open_loop_steps))]

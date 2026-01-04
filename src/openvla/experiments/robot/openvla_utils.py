@@ -381,7 +381,8 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
     prompt_cache = last_caches['past_key_values'] if last_caches is not None else None
     vit_cache = last_caches.get('vit_cache') if last_caches is not None else None
     prev_attn = last_caches['attentions'] if last_caches is not None else None
-    mask_indices = None
+    mask_indices_vit = None
+    mask_indices_llm = None
     vla.language_model.config.proportion_attn_var = None
 
 
@@ -401,44 +402,85 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
             mode_msg = ">> ViT benchmark + VLA on" if cfg.use_vla_cache else ">> ViT benchmark + VLA off"
         print(mode_msg)
 
-        stable_patches = None
-        if prompt_cache is not None or cfg.vit_cache_standalone or cfg.vit_cache_benchmark:
-            patch_metric = getattr(cfg, "vit_cache_patch_metric", "cosine")
-            def _get_thresholds(role: str):
-                if patch_metric == "gray_diff":
-                    diff_thr = getattr(
-                        cfg, "vit_cache_gray_diff_threshold", getattr(cfg, "vit_cache_patch_diff_threshold", 0.1)
-                    )
-                    return None, diff_thr
-                if patch_metric == "rgb_diff":
-                    diff_thr = getattr(
-                        cfg, "vit_cache_rgb_diff_threshold", getattr(cfg, "vit_cache_patch_diff_threshold", 0.1)
-                    )
-                    return None, diff_thr
-                sim_thr = getattr(cfg, "vit_cache_sim_threshold", 0.996)
-                return sim_thr, getattr(cfg, "vit_cache_patch_diff_threshold", 0.1)
+        stable_patches_vit = None
+        stable_patches_llm = None
+        if prompt_cache is not None or cfg.vit_cache_standalone or cfg.vit_cache_benchmark or cfg.use_vla_cache:
+            def _resolve_llm_param(name: str, default):
+                val = getattr(cfg, f"llm_cache_{name}", None)
+                return default if val is None else val
 
-            sim_thr, diff_thr = _get_thresholds("vit")
-            stable_patches = find_static_patches(
+            vit_metric = getattr(cfg, "vit_cache_patch_metric", "cosine")
+            llm_metric = _resolve_llm_param("patch_metric", vit_metric)
+
+            vit_sim = getattr(cfg, "vit_cache_sim_threshold", 0.996)
+            vit_diff = getattr(cfg, "vit_cache_patch_diff_threshold", 0.1)
+            vit_gray = getattr(cfg, "vit_cache_gray_diff_threshold", vit_diff)
+            vit_rgb = getattr(cfg, "vit_cache_rgb_diff_threshold", vit_diff)
+
+            llm_sim = _resolve_llm_param("sim_threshold", vit_sim)
+            llm_diff = _resolve_llm_param("patch_diff_threshold", vit_diff)
+            llm_gray = _resolve_llm_param("gray_diff_threshold", vit_gray)
+            llm_rgb = _resolve_llm_param("rgb_diff_threshold", vit_rgb)
+
+            vit_static_top_k = getattr(cfg, "vit_cache_static_top_k", 130)
+            llm_static_top_k = _resolve_llm_param("static_top_k", vit_static_top_k)
+
+            def _get_thresholds(metric, sim_thr, gray_thr, rgb_thr, diff_thr):
+                if metric == "gray_diff":
+                    return None, gray_thr if gray_thr is not None else diff_thr
+                if metric == "rgb_diff":
+                    return None, rgb_thr if rgb_thr is not None else diff_thr
+                return sim_thr, diff_thr
+
+            vit_sim_thr, vit_diff_thr = _get_thresholds(vit_metric, vit_sim, vit_gray, vit_rgb, vit_diff)
+            llm_sim_thr, llm_diff_thr = _get_thresholds(llm_metric, llm_sim, llm_gray, llm_rgb, llm_diff)
+
+            stable_patches_vit = find_static_patches(
                 image,
                 prev_image,
-                top_k=getattr(cfg, "vit_cache_static_top_k", 130),
-                metric=patch_metric,
-                sim_threshold=sim_thr if sim_thr is not None else 0.996,
-                diff_threshold=diff_thr,
+                top_k=vit_static_top_k,
+                metric=vit_metric,
+                sim_threshold=vit_sim_thr if vit_sim_thr is not None else 0.996,
+                diff_threshold=vit_diff_thr,
+            )
+            stable_patches_llm = find_static_patches(
+                image,
+                prev_image,
+                top_k=llm_static_top_k,
+                metric=llm_metric,
+                sim_threshold=llm_sim_thr if llm_sim_thr is not None else 0.996,
+                diff_threshold=llm_diff_thr,
             )
 
         if prev_attn is not None:
-            result_image, remaining_static_tokens_indices = task_relevant_selection(
+            vit_attn_top_k = getattr(cfg, "vit_cache_attention_top_k", 120)
+            llm_attn_top_k = _resolve_llm_param("attention_top_k", vit_attn_top_k)
+
+            result_image, remaining_static_tokens_vit = task_relevant_selection(
                 prev_attn,
                 image,
-                stable_patches,
-                top_k=getattr(cfg, "vit_cache_attention_top_k", 120),
+                stable_patches_vit,
+                top_k=vit_attn_top_k,
             )
-            mask_indices = torch.tensor(remaining_static_tokens_indices, device=DEVICE) if remaining_static_tokens_indices else None
+            _, remaining_static_tokens_llm = task_relevant_selection(
+                prev_attn,
+                image,
+                stable_patches_llm,
+                top_k=llm_attn_top_k,
+            )
+            mask_indices_vit = (
+                torch.tensor(remaining_static_tokens_vit, device=DEVICE)
+                if remaining_static_tokens_vit
+                else None
+            )
+            mask_indices_llm = (
+                torch.tensor(remaining_static_tokens_llm, device=DEVICE)
+                if remaining_static_tokens_llm
+                else None
+            )
 
             if cfg.use_vla_cache:
-                vla.language_model.config.reusable_patches = mask_indices
+                vla.language_model.config.reusable_patches = mask_indices_llm
                 vla.language_model.config.proportion_attn_var = get_layer_mask_schedule(prev_attn)
 
         if not cfg.use_vla_cache:
@@ -448,7 +490,7 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
     else:
         print(">> VLA-Cache disabled")
         prompt_cache = None
-        mask_indices = None
+        mask_indices_llm = None
 
     # Configure ViT KV cache reuse (static patch K/V)
     vit_cache_out = None
@@ -490,7 +532,7 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
         reuse_mask_full = _prepare_featurizer(
             vla.vision_backbone.featurizer,
             None if vit_cache is None else vit_cache.get("alpha"),
-            mask_indices,
+            mask_indices_vit,
         )
 
         # Fused backbone (if exists) uses同样的缓存/掩码策略
@@ -498,7 +540,7 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
             _prepare_featurizer(
                 vla.vision_backbone.fused_featurizer,
                 None if vit_cache is None else vit_cache.get("beta"),
-                mask_indices,
+                mask_indices_vit,
             )
     else:
         # Ensure stale cache not reused
