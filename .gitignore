@@ -180,9 +180,17 @@ notes/vlacache_paper/
 notes/
 
 results/
+results*/
 
 scripts/
 
 Papers/
 
 results_old/
+results_different2patchs/
+
+src/openvla/*.sh
+*.sh
+
+scripts_openvla/
+scripts_openvlaoft/

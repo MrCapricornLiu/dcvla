@@ -21,8 +21,14 @@ from libero.libero import benchmark
 
 import wandb
 
-# Append current directory so that interpreter can find experiments.robot
-sys.path.append("../..")
+# Ensure imports resolve to openvla-oft (not openvla)
+_this_file = Path(__file__).resolve()
+# Add openvla-oft root (parent of "experiments") to sys.path
+_oft_root = _this_file.parents[3]
+sys.path.insert(0, str(_oft_root))
+# Drop openvla path if it was added elsewhere
+_openvla_root = _this_file.parents[5] / "src" / "openvla"
+sys.path = [p for p in sys.path if Path(p).resolve() != _openvla_root]
 from experiments.robot.libero.libero_utils import (
     get_libero_dummy_action,
     get_libero_env,
@@ -84,6 +90,19 @@ class GenerateConfig:
 
     # Use VLA-Cache for faster inference
     use_vla_cache: bool = True
+    # Use ViT cache reuse (OpenVLA-style)
+    use_vit_cache: bool = False
+    vit_cache_reuse: bool = True
+    vit_cache_standalone: bool = False
+    vit_cache_benchmark: bool = True
+    vit_cache_keyframe_interval: int = 0
+    vit_cache_patch_metric: str = "cosine"
+    vit_cache_patch_diff_threshold: float = 0.1
+    vit_cache_gray_diff_threshold: float = 0.1
+    vit_cache_rgb_diff_threshold: float = 0.05
+    vit_cache_sim_threshold: float = 0.996
+    vit_cache_attention_top_k: int = 120
+    vit_cache_static_top_k: int = 130
 
     #################################################################################################################
     # Model-specific parameters
@@ -115,6 +134,8 @@ class GenerateConfig:
     task_suite_name: str = TaskSuite.LIBERO_SPATIAL  # Task suite
     num_steps_wait: int = 10                         # Number of steps to wait for objects to stabilize in sim
     num_trials_per_task: int = 50                    # Number of rollouts per task
+    num_tasks: Optional[int] = None                  # Number of tasks to evaluate (None = all tasks)
+    task_start_id: int = 0                           # Starting task ID (0-indexed)
     initial_states_path: str = "DEFAULT"             # "DEFAULT", or path to initial states JSON file
     env_img_res: int = 256                           # Resolution for environment images (not policy input resolution)
 
@@ -474,7 +495,17 @@ def run_task(
         total_task_static_tokens_primary += eposode_metrics["episode_task_static_tokens_primary"]
         total_task_static_tokens_wrist += eposode_metrics["episode_task_static_tokens_wrist"]
         
-        print(f"Average time per step: {(total_time/total_steps)*1000:.4f} ms, Control Frequency: {total_steps / total_time * 8:.2f} Hz, Token Reusing Ratio (Primary): {(total_task_static_tokens_primary/total_steps/256*100):.2f} %, , Token Reusing Ratio (Wrist): {(total_task_static_tokens_wrist/total_steps/256*100):.2f} %")
+        if total_steps > 0 and total_time > 0:
+            avg_step_ms = (total_time / total_steps) * 1000.0
+            ctrl_hz = (total_steps / total_time) * 8.0
+            reuse_primary = (total_task_static_tokens_primary / total_steps / 256.0) * 100.0
+            reuse_wrist = (total_task_static_tokens_wrist / total_steps / 256.0) * 100.0
+            print(
+                f"Average time per step: {avg_step_ms:.4f} ms, Control Frequency: {ctrl_hz:.2f} Hz, "
+                f"Token Reusing Ratio (Primary): {reuse_primary:.2f} %, Token Reusing Ratio (Wrist): {reuse_wrist:.2f} %"
+            )
+        else:
+            print("Average time per step: n/a (no steps or time recorded yet)")
 
         # Update counters
         task_episodes += 1
@@ -538,13 +569,28 @@ def eval_libero(cfg: GenerateConfig) -> float:
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[cfg.task_suite_name]()
-    num_tasks = task_suite.n_tasks
+    num_tasks_in_suite = task_suite.n_tasks
+    task_end_id = cfg.task_start_id + cfg.num_tasks if cfg.num_tasks is not None else num_tasks_in_suite
+    task_end_id = min(task_end_id, num_tasks_in_suite)
+
+    assert cfg.task_start_id >= 0, f"task_start_id must be >= 0, got {cfg.task_start_id}"
+    assert cfg.task_start_id < num_tasks_in_suite, (
+        f"task_start_id ({cfg.task_start_id}) must be < num_tasks_in_suite ({num_tasks_in_suite})"
+    )
+    assert task_end_id > cfg.task_start_id, (
+        f"No tasks to evaluate! task_start_id={cfg.task_start_id}, task_end_id={task_end_id}"
+    )
+
+    log_message(
+        f"Evaluating tasks {cfg.task_start_id} to {task_end_id-1} (total: {task_end_id - cfg.task_start_id} tasks)",
+        log_file,
+    )
 
     log_message(f"Task suite: {cfg.task_suite_name}", log_file)
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks)):
+    for task_id in tqdm.tqdm(range(cfg.task_start_id, task_end_id)):
         total_episodes, total_successes = run_task(
             cfg,
             task_suite,

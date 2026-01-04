@@ -4,6 +4,7 @@ import filecmp
 import json
 import os
 import shutil
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +21,12 @@ from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq,
 
 # Apply JSON numpy patch for serialization
 json_numpy.patch()
+
+# Ensure local timm (with VLA cache hooks) is visible before prismatic imports it.
+_this_file = Path(__file__).resolve()
+_src_root = _this_file.parents[3]
+_timm_path = _src_root / "pytorch-image-models"
+sys.path.insert(0, str(_timm_path))
 
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
@@ -758,36 +765,100 @@ def get_vla_action(
     
     prev_images = obs["prev_images"]
     prev_images = prepare_images_for_vla(prev_images, cfg)
-    prompt_cache = last_caches['past_key_values'] if last_caches is not None else None
-    prev_attn = last_caches['attentions'] if last_caches is not None else None
-    
+    prompt_cache = last_caches["past_key_values"] if last_caches is not None else None
+    prev_attn = last_caches["attentions"] if last_caches is not None else None
+    vit_cache = last_caches.get("vit_cache") if last_caches is not None else None
+
     mask_indices = None
+    mask_indices_vit = None
+    remaining_static_tokens_primary = []
+    remaining_static_tokens_wrist = []
     vla.language_model.config.proportion_attn_var = None
-    
-    if cfg.use_vla_cache:
-        print(">> VLA-Cache inference mode")
-        # Step 1: Identify visually stable patches across frames
-        if prompt_cache is not None:
-            stable_patches_primary = find_static_patches(all_images[0], prev_images[0], top_k=150)
-            stable_patches_wrist = find_static_patches(all_images[1], prev_images[1], top_k=150)
+
+    # Always run ViT mask setup (benchmark or real cache)
+    if True:
+        if cfg.use_vit_cache:
+            mode_msg = ">> ViT cache + VLA on" if cfg.use_vla_cache else ">> ViT cache + VLA off"
+        else:
+            mode_msg = ">> ViT benchmark + VLA on" if cfg.use_vla_cache else ">> ViT benchmark + VLA off"
+        print(mode_msg)
+
+        stable_patches_primary = None
+        stable_patches_wrist = None
+        if prompt_cache is not None or cfg.vit_cache_standalone or cfg.vit_cache_benchmark:
+            patch_metric = getattr(cfg, "vit_cache_patch_metric", "cosine")
+
+            def _get_thresholds(role: str):
+                if patch_metric == "gray_diff":
+                    diff_thr = getattr(
+                        cfg, "vit_cache_gray_diff_threshold", getattr(cfg, "vit_cache_patch_diff_threshold", 0.1)
+                    )
+                    return None, diff_thr
+                if patch_metric == "rgb_diff":
+                    diff_thr = getattr(
+                        cfg, "vit_cache_rgb_diff_threshold", getattr(cfg, "vit_cache_patch_diff_threshold", 0.1)
+                    )
+                    return None, diff_thr
+                sim_thr = getattr(cfg, "vit_cache_sim_threshold", 0.996)
+                return sim_thr, getattr(cfg, "vit_cache_patch_diff_threshold", 0.1)
+
+            sim_thr, diff_thr = _get_thresholds("vit")
+            stable_patches_primary = find_static_patches(
+                all_images[0],
+                prev_images[0],
+                top_k=getattr(cfg, "vit_cache_static_top_k", 130),
+                metric=patch_metric,
+                sim_threshold=sim_thr if sim_thr is not None else 0.996,
+                diff_threshold=diff_thr,
+            )
+            if len(all_images) > 1 and len(prev_images) > 1:
+                stable_patches_wrist = find_static_patches(
+                    all_images[1],
+                    prev_images[1],
+                    top_k=getattr(cfg, "vit_cache_static_top_k", 130),
+                    metric=patch_metric,
+                    sim_threshold=sim_thr if sim_thr is not None else 0.996,
+                    diff_threshold=diff_thr,
+                )
 
         # Step 2: Use prior attention to filter out task-relevant tokens
         if prev_attn is not None:
+            if stable_patches_primary is None:
+                stable_patches_primary = []
+            if stable_patches_wrist is None:
+                stable_patches_wrist = []
+
             vis_primary, remaining_static_tokens_primary = task_relevant_selection(
-                prev_attn, result_image[0], stable_patches_primary, primary=True
+                prev_attn,
+                result_image[0],
+                stable_patches_primary,
+                primary=True,
+                top_k=getattr(cfg, "vit_cache_attention_top_k", 120),
             )
-            vis_wrist, remaining_static_tokens_wrist = task_relevant_selection(
-                prev_attn, result_image[1], stable_patches_wrist, primary=False
-            )
+            if len(result_image) > 1:
+                vis_wrist, remaining_static_tokens_wrist = task_relevant_selection(
+                    prev_attn,
+                    result_image[1],
+                    stable_patches_wrist,
+                    primary=False,
+                    top_k=getattr(cfg, "vit_cache_attention_top_k", 120),
+                )
+                result_image = [vis_primary, vis_wrist]
+            else:
+                result_image = [vis_primary]
 
-            result_image = [vis_primary, vis_wrist]
-
-            # Step 3: Merge remaining static token indices and update model config
+            # Merge remaining static token indices and update model config
             final_static_token_indices = remaining_static_tokens_primary + remaining_static_tokens_wrist
             mask_indices = torch.tensor(final_static_token_indices, device=DEVICE) if final_static_token_indices else None
 
-            vla.language_model.config.reusable_patches = mask_indices
-            vla.language_model.config.proportion_attn_var = get_layer_mask_schedule(prev_attn)
+            if cfg.use_vla_cache:
+                vla.language_model.config.reusable_patches = mask_indices
+                vla.language_model.config.proportion_attn_var = get_layer_mask_schedule(prev_attn)
+
+        if not cfg.use_vla_cache:
+            # honor flag: do not reuse LLaMA cache when VLA-Cache is off
+            prompt_cache = None
+            mask_indices = None
 
     else:
         print(">> VLA-Cache disabled")
@@ -797,6 +868,77 @@ def get_vla_action(
     if prompt_cache is None:
         prompt_cache = DynamicCache()
 
+
+    # Configure ViT KV cache reuse (static patch K/V)
+    vit_cache_out = None
+    enable_vit = True  # always run ViT cache pipeline (benchmark or real reuse)
+    if enable_vit:
+        # Build ViT-side patch indices (per-image -> global) for reuse
+        if remaining_static_tokens_primary or remaining_static_tokens_wrist:
+            try:
+                num_patches = vla.vision_backbone.get_num_patches()
+            except Exception:
+                num_patches = vla.vision_backbone.featurizer.patch_embed.num_patches
+            vit_indices = []
+            for idx in remaining_static_tokens_primary:
+                patch_idx = idx - 1
+                if 0 <= patch_idx < num_patches:
+                    vit_indices.append(patch_idx)
+            for idx in remaining_static_tokens_wrist:
+                patch_idx = idx - (1 + num_patches)
+                if 0 <= patch_idx < num_patches:
+                    vit_indices.append(num_patches + patch_idx)
+            mask_indices_vit = torch.tensor(vit_indices, device=DEVICE) if vit_indices else None
+
+        def _prepare_featurizer(featurizer, cache_payload, mask_idx):
+            num_prefix = getattr(featurizer, "num_prefix_tokens", 0)
+            num_patches = featurizer.patch_embed.num_patches
+            try:
+                num_images = vla.vision_backbone.get_num_images_in_input()
+            except Exception:
+                num_images = cfg.num_images_in_input
+            reuse_mask_local = torch.zeros(num_prefix + num_patches * num_images, dtype=torch.bool, device=DEVICE)
+            if mask_idx is not None:
+                valid_idx = mask_idx[(mask_idx >= 0) & (mask_idx < num_patches * num_images)]
+                reuse_mask_local[num_prefix + valid_idx] = True
+            use_cache_payload = (cache_payload is not None and cfg.use_vit_cache and not cfg.vit_cache_benchmark)
+            if use_cache_payload:
+                cache_state = cache_payload
+            elif cfg.use_vit_cache:
+                cache_state = featurizer.get_vla_cache_state()
+            else:
+                cache_state = [None] * len(featurizer.blocks)
+            featurizer.set_vla_cache_state(
+                cache_state,
+                reuse_mask_local,
+                enable_reuse=cfg.use_vit_cache,
+                enable_static_reuse=getattr(cfg, "vit_cache_reuse", True),
+                keyframe_interval=getattr(cfg, "vit_cache_keyframe_interval", 0),
+            )
+            static_count = reuse_mask_local.sum().item()
+            total_count = reuse_mask_local.numel()
+            ratio = static_count / max(1, total_count)
+            print(f"[ViT Reuse] static={static_count}/{total_count} ({ratio:.3f})")
+            return reuse_mask_local
+
+        _prepare_featurizer(
+            vla.vision_backbone.featurizer,
+            None if vit_cache is None else vit_cache.get("alpha"),
+            mask_indices_vit,
+        )
+
+        if getattr(vla.vision_backbone, "use_fused_vision_backbone", False):
+            _prepare_featurizer(
+                vla.vision_backbone.fused_featurizer,
+                None if vit_cache is None else vit_cache.get("beta"),
+                mask_indices_vit,
+            )
+    else:
+        if hasattr(vla.vision_backbone.featurizer, "reset_vla_cache"):
+            vla.vision_backbone.featurizer.reset_vla_cache()
+        if getattr(vla.vision_backbone, "use_fused_vision_backbone", False):
+            if hasattr(vla.vision_backbone.fused_featurizer, "reset_vla_cache"):
+                vla.vision_backbone.fused_featurizer.reset_vla_cache()
 
     # Extract primary image and additional images
     primary_image = all_images.pop(0)
@@ -845,6 +987,14 @@ def get_vla_action(
             use_film=use_film,
             past_key_values=prompt_cache,
         )
+        # Collect ViT cache for next frame
+        if cfg.use_vit_cache and not cfg.vit_cache_benchmark and last_caches is not None:
+            vit_cache_out = {
+                "alpha": vla.vision_backbone.featurizer.get_vla_cache_state()
+            }
+            if getattr(vla.vision_backbone, "use_fused_vision_backbone", False):
+                vit_cache_out["beta"] = vla.vision_backbone.fused_featurizer.get_vla_cache_state()
+            last_caches["vit_cache"] = vit_cache_out
     # End timer
     end_time = time.time()
     time_elapsed = end_time - start_time
