@@ -197,17 +197,12 @@ class Attention(nn.Module):
             dynamic_idx = (~effective_static).nonzero(as_tuple=True)[0]
             static_idx = effective_static.nonzero(as_tuple=True)[0]
 
-            # Compute KV for dynamic tokens only
+            # Compute Q/K/V for dynamic tokens once, update K/V cache, and run dynamic queries over full cached K/V.
             if dynamic_idx.numel() > 0:
-                k_dyn, v_dyn = _project_kv(x[:, dynamic_idx, :])
-                cache.update(dynamic_idx, k_dyn, v_dyn)
-
-            # Compute attention for dynamic queries over full KV (static + dynamic)
-            if dynamic_idx.numel() > 0:
-                # Single qkv projection on dynamic slice to keep kernel count low
                 qkv_dyn = self.qkv(x[:, dynamic_idx, :]).reshape(B, dynamic_idx.numel(), 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
                 q_dyn, k_dyn, v_dyn = qkv_dyn.unbind(0)
                 q_dyn, k_dyn = self.q_norm(q_dyn), self.k_norm(k_dyn)
+                cache.update(dynamic_idx, k_dyn, v_dyn)
                 if self.fused_attn:
                     out_dyn = F.scaled_dot_product_attention(
                         q_dyn, cache.k, cache.v,
@@ -426,6 +421,7 @@ class Block(nn.Module):
         if (
             cache_enabled
             and static_reuse_enabled
+            and not force_keyframe
             and cache is not None
             and cache.mlp_out is not None
             and cache.block_out is not None
@@ -479,7 +475,7 @@ class Block(nn.Module):
                     pass
             return x_out
 
-        if cache_enabled and cache is not None and cache.mlp_out is not None and reuse_mask is not None and reuse_mask.numel() == x.shape[1]:
+        if cache_enabled and not force_keyframe and cache is not None and cache.mlp_out is not None and reuse_mask is not None and reuse_mask.numel() == x.shape[1]:
             dynamic_idx = (~reuse_mask).nonzero(as_tuple=True)[0]
             static_idx = reuse_mask.nonzero(as_tuple=True)[0]
 
@@ -986,9 +982,6 @@ class VisionTransformer(nn.Module):
         self._vla_static_reuse_enabled = enable_static_reuse
         if keyframe_interval is not None:
             self._vla_keyframe_interval = int(keyframe_interval)
-        # reset frame index when cache state is refreshed
-        self._vla_frame_idx = 0
-        self._vla_force_keyframe = False
 
     @torch.jit.ignore
     def get_vla_cache_state(self) -> Optional[List[Optional[VitBlockCache]]]:
@@ -999,6 +992,8 @@ class VisionTransformer(nn.Module):
         self._vla_cache_state = [None] * len(self.blocks)
         self._vla_reuse_mask = None
         self._vla_cache_enabled = False
+        self._vla_frame_idx = 0
+        self._vla_force_keyframe = False
 
     @torch.jit.ignore
     def get_classifier(self):

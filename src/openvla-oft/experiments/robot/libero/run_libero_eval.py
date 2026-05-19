@@ -13,6 +13,12 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Union
+
+_this_file = Path(__file__).resolve()
+_repo_root = _this_file.parents[5]
+sys.path.insert(0, str(_repo_root / "src" / "transformers" / "src"))
+sys.path.insert(0, str(_repo_root / "src" / "pytorch-image-models"))
+
 import imageio
 import draccus
 import numpy as np
@@ -22,7 +28,6 @@ from libero.libero import benchmark
 import wandb
 
 # Ensure imports resolve to openvla-oft (not openvla)
-_this_file = Path(__file__).resolve()
 # Add openvla-oft root (parent of "experiments") to sys.path
 _oft_root = _this_file.parents[3]
 sys.path.insert(0, str(_oft_root))
@@ -111,6 +116,9 @@ class GenerateConfig:
     llm_cache_sim_threshold: Optional[float] = None
     llm_cache_attention_top_k: Optional[int] = None
     llm_cache_static_top_k: Optional[int] = None
+    # EfficientVLA-style LLM-side visual token deletion. Disabled by default.
+    llm_delete_enable: bool = False
+    llm_delete_ratio: float = 0.0
 
     #################################################################################################################
     # Model-specific parameters

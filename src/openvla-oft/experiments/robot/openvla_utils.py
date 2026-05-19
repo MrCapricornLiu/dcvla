@@ -771,9 +771,13 @@ def get_vla_action(
 
     mask_indices_vit = None
     mask_indices_llm = None
+    mask_indices_delete_llm = None
     remaining_static_tokens_primary = []
     remaining_static_tokens_wrist = []
     vla.language_model.config.proportion_attn_var = None
+    vla.language_model.config.reusable_patches = None
+    vla.language_model.config.deleted_patches = None
+    vla.language_model.config.current_deleted_patches = None
 
     # Always run ViT mask setup (benchmark or real cache)
     if True:
@@ -865,6 +869,7 @@ def get_vla_action(
 
             vit_attn_top_k = getattr(cfg, "vit_cache_attention_top_k", 120)
             llm_attn_top_k = _resolve_llm_param("attention_top_k", vit_attn_top_k)
+            llm_delete_ratio = getattr(cfg, "llm_delete_ratio", 0.0) if getattr(cfg, "llm_delete_enable", False) else 0.0
 
             vis_primary, remaining_static_tokens_primary_vit = task_relevant_selection(
                 prev_attn,
@@ -873,12 +878,14 @@ def get_vla_action(
                 primary=True,
                 top_k=vit_attn_top_k,
             )
-            _, remaining_static_tokens_primary_llm = task_relevant_selection(
+            _, remaining_static_tokens_primary_llm, delete_tokens_primary_llm = task_relevant_selection(
                 prev_attn,
                 result_image[0],
                 stable_patches_primary_llm,
                 primary=True,
                 top_k=llm_attn_top_k,
+                delete_ratio=llm_delete_ratio,
+                return_delete=True,
             )
             if len(result_image) > 1:
                 vis_wrist, remaining_static_tokens_wrist_vit = task_relevant_selection(
@@ -888,17 +895,20 @@ def get_vla_action(
                     primary=False,
                     top_k=vit_attn_top_k,
                 )
-                _, remaining_static_tokens_wrist_llm = task_relevant_selection(
+                _, remaining_static_tokens_wrist_llm, delete_tokens_wrist_llm = task_relevant_selection(
                     prev_attn,
                     result_image[1],
                     stable_patches_wrist_llm,
                     primary=False,
                     top_k=llm_attn_top_k,
+                    delete_ratio=llm_delete_ratio,
+                    return_delete=True,
                 )
                 result_image = [vis_primary, vis_wrist]
             else:
                 remaining_static_tokens_wrist_vit = []
                 remaining_static_tokens_wrist_llm = []
+                delete_tokens_wrist_llm = []
                 result_image = [vis_primary]
 
             final_static_token_indices_vit = (
@@ -906,6 +916,9 @@ def get_vla_action(
             )
             final_static_token_indices_llm = (
                 remaining_static_tokens_primary_llm + remaining_static_tokens_wrist_llm
+            )
+            final_delete_token_indices_llm = (
+                delete_tokens_primary_llm + delete_tokens_wrist_llm
             )
             # Keep vit lists for downstream reuse mapping
             remaining_static_tokens_primary = remaining_static_tokens_primary_vit
@@ -920,9 +933,15 @@ def get_vla_action(
                 if final_static_token_indices_llm
                 else None
             )
+            mask_indices_delete_llm = (
+                torch.tensor(final_delete_token_indices_llm, device=DEVICE)
+                if final_delete_token_indices_llm
+                else None
+            )
 
             if cfg.use_vla_cache:
                 vla.language_model.config.reusable_patches = mask_indices_llm
+                vla.language_model.config.deleted_patches = mask_indices_delete_llm
                 vla.language_model.config.proportion_attn_var = get_layer_mask_schedule(prev_attn)
 
         if not cfg.use_vla_cache:
@@ -971,10 +990,13 @@ def get_vla_action(
             if mask_idx is not None:
                 valid_idx = mask_idx[(mask_idx >= 0) & (mask_idx < num_patches * num_images)]
                 reuse_mask_local[num_prefix + valid_idx] = True
+            # In benchmark mode we keep the internal featurizer cache within an episode but do not serialize it in last_caches.
+            if last_caches is None and cfg.use_vit_cache and hasattr(featurizer, "reset_vla_cache"):
+                featurizer.reset_vla_cache()
             use_cache_payload = (cache_payload is not None and cfg.use_vit_cache and not cfg.vit_cache_benchmark)
             if use_cache_payload:
                 cache_state = cache_payload
-            elif cfg.use_vit_cache:
+            elif cfg.use_vit_cache and last_caches is not None:
                 cache_state = featurizer.get_vla_cache_state()
             else:
                 cache_state = [None] * len(featurizer.blocks)

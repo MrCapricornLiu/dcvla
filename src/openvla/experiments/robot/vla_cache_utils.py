@@ -163,17 +163,34 @@ def token_attention_merge(multihead_attention, layer_id=15):
     t_token_start = v_token_end
     t_token_end = t_token_start + 35
 
-    attention_pos = multihead_attention[-1]
-    text_mask = (attention_pos >= t_token_start) & (attention_pos < t_token_end)
+    position_meta = multihead_attention[-1]
+    if isinstance(position_meta, (tuple, list)):
+        query_pos, key_pos = position_meta
+    else:
+        query_pos = key_pos = position_meta
+    query_pos = query_pos.to(attn_map.device)
+    key_pos = key_pos.to(attn_map.device)
 
-    relation = attn_map[text_mask, v_token_start:v_token_end]
-    return relation.mean(dim=0).cpu()
+    text_mask = (query_pos >= t_token_start) & (query_pos < t_token_end)
+    vision_mask = (key_pos >= v_token_start) & (key_pos < v_token_end)
+    scores = torch.zeros(256, dtype=torch.float32, device=attn_map.device)
+    if text_mask.any() and vision_mask.any():
+        relation = attn_map[text_mask][:, vision_mask].mean(dim=0)
+        patch_ids = (key_pos[vision_mask] - v_token_start).to(torch.long)
+        valid = (patch_ids >= 0) & (patch_ids < 256)
+        scores[patch_ids[valid]] = relation[valid]
+    return scores.cpu()
 
 def get_top_attention_patches(attn_scores, top_k=120):
     """
     Selects top-k patch indices based on attention scores.
     """
     attn_scores = attn_scores.cpu().numpy() if isinstance(attn_scores, torch.Tensor) else attn_scores
+    attn_scores = np.asarray(attn_scores, dtype=np.float32).reshape(-1)
+    if attn_scores.size < 256:
+        attn_scores = np.pad(attn_scores, (0, 256 - attn_scores.size), constant_values=0.0)
+    elif attn_scores.size > 256:
+        attn_scores = attn_scores[:256]
     attn = attn_scores.reshape(16, 16)
     attn_resized = cv2.resize(attn, (16, 16))
 
@@ -181,7 +198,7 @@ def get_top_attention_patches(attn_scores, top_k=120):
     flat.sort(key=lambda x: x[1], reverse=True)
     return [idx for idx, _ in flat[:top_k]]
 
-def draw_patches_overlay(image, patch_groups, patch_size=14, alpha=0.4):
+def draw_patches_overlay(image, patch_groups, patch_size=14, alpha=0.4, draw_grid=True):
     """
     Draws colored overlays on image for different patch groups.
     """
@@ -191,6 +208,12 @@ def draw_patches_overlay(image, patch_groups, patch_size=14, alpha=0.4):
 
     width = image.size[0]
     num_patches = width // patch_size
+
+    if draw_grid:
+        grid_color = (255, 255, 255, int(255 * 0.25))
+        for i in range(0, width + 1, patch_size):
+            draw.line([(i, 0), (i, width)], fill=grid_color, width=1)
+            draw.line([(0, i), (width, i)], fill=grid_color, width=1)
 
     for patch_list, color in patch_groups:
         for pid in patch_list:
@@ -208,28 +231,55 @@ def visualize_significant_patches_mask(image, patch_ids, patch_size=14, alpha=0.
     overlay_group = [(patch_ids, color)]
     return draw_patches_overlay(image, overlay_group, patch_size, alpha)
 
-def task_relevant_selection(multihead_attention, image, significant_patches, top_k=120):
+def task_relevant_selection(multihead_attention, image, significant_patches, top_k=120, delete_ratio=0.0, return_delete=False):
     """
     Highlights and compares significant patches with top attention patches.
+
+    Returns reusable static visual-token positions. When ``return_delete`` is True,
+    also returns the lowest-attention subset of reusable candidates as delete positions.
+    Positions are LLM visual-token positions (patch id + 1 for OpenVLA).
     """
     attn_score = token_attention_merge(multihead_attention)
     top_patches = get_top_attention_patches(attn_score, top_k)
+    attn_values = attn_score.cpu().numpy() if isinstance(attn_score, torch.Tensor) else attn_score
 
-    only_significant = set(significant_patches) - set(top_patches)
-    only_top = set(top_patches) - set(significant_patches)
-    overlap = set(significant_patches) & set(top_patches)
+    grid_size = 224 // 14
+    all_ids = set(range(grid_size * grid_size))
+    static_set = set(significant_patches or [])
+    task_set = set(top_patches)
+    dynamic_set = all_ids - static_set
 
+    # dynamic/task visualization: recompute = dynamic ∪ task
+    dynamic_only = dynamic_set - task_set
+    task_only = task_set - dynamic_set
+    overlap = dynamic_set & task_set
+
+    # Three-way visualization: dynamic-only, task-only, overlap
     patch_groups = [
-        (significant_patches, (15, 67, 223)),
-        (top_patches, (254, 55, 13)),
-        (only_significant, (40, 116, 166)),
-        (only_top, (241, 196, 15)),
-        (overlap, (231, 76, 60)),
+        (dynamic_only, (35, 166, 213)),  # dynamic-only (cyan)
+        (task_only, (155, 89, 182)),     # task-only (purple)
+        (overlap, (231, 111, 81)),       # overlap (orange)
     ]
 
     result_image = draw_patches_overlay(image, patch_groups, patch_size=14, alpha=0.4)
 
-    v_token_start = 1
-    remaining = sorted([pid + v_token_start for pid in only_significant])
+    reusable_candidates = sorted(static_set - task_set)
+    delete_count = int(len(reusable_candidates) * max(0.0, min(float(delete_ratio), 1.0)))
+    if delete_count > 0:
+        delete_patch_ids = sorted(
+            reusable_candidates,
+            key=lambda pid: float(attn_values[pid]) if 0 <= pid < len(attn_values) else 0.0,
+        )[:delete_count]
+        delete_set = set(delete_patch_ids)
+    else:
+        delete_set = set()
 
+    reuse_patch_ids = sorted(pid for pid in reusable_candidates if pid not in delete_set)
+    v_token_start = 1
+    remaining = sorted([pid + v_token_start for pid in reuse_patch_ids])
+    # Keep deletion ordered by increasing attention so layer-wise ratios delete the least relevant patches first.
+    deleted = [pid + v_token_start for pid in delete_patch_ids] if delete_count > 0 else []
+
+    if return_delete:
+        return np.array(result_image), remaining, deleted
     return np.array(result_image), remaining

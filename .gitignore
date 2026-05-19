@@ -194,3 +194,21 @@ src/openvla/*.sh
 
 scripts_openvla/
 scripts_openvlaoft/
+
+# Local paper/review workspaces and agent transcripts
+acl/
+review/
+sessions/
+
+# Local third-party benchmark checkouts
+src/RoboTwin/
+src/SimplerEnv/
+src/SimplerEnv-OpenVLA/
+src/ttf-vla/
+
+# Local nested fork; commit changes inside this repository separately
+src/transformers/
+
+# Generated backups and run logs
+*.bak.*
+nohup.out
