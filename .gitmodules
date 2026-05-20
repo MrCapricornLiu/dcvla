@@ -1,0 +1,8 @@
+[submodule "src/openvla/LIBERO"]
+	path = src/openvla/LIBERO
+	url = https://github.com/Lifelong-Robot-Learning/LIBERO.git
+	branch = master
+[submodule "src/openvla-oft/LIBERO"]
+	path = src/openvla-oft/LIBERO
+	url = https://github.com/Lifelong-Robot-Learning/LIBERO.git
+	branch = master

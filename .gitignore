@@ -212,3 +212,19 @@ src/transformers/
 # Generated backups and run logs
 *.bak.*
 nohup.out
+
+# Project handoff and reproducibility files that should remain versioned.
+!AGENTS.md
+!CODE_SYNC.md
+!patches/
+!patches/**
+
+# Experiment launch scripts are intentionally versioned for reproducible runs.
+!scripts/
+!scripts/**
+!scripts_openvla/
+!scripts_openvla/**
+!scripts_openvla_oft/
+!scripts_openvla_oft/**
+!src/openvla/*.sh
+!src/openvla-oft/*.sh

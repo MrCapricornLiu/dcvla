@@ -156,6 +156,7 @@ wandb/
 checkpoints/
 runs/
 LIBERO/
+!LIBERO/
 rollouts/
 wandb/
 logs/

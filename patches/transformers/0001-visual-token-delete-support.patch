@@ -1,0 +1,329 @@
+From 8803bf29903f99848f60650918a4689f80f4aa22 Mon Sep 17 00:00:00 2001
+From: lch <chliu@stu.pku.edu.cn>
+Date: Tue, 19 May 2026 14:58:14 +0800
+Subject: [PATCH] Add visual token delete support to LLaMA cache reuse
+
+---
+ .../models/llama/modeling_llama.py            | 244 +++++++++++++++---
+ 1 file changed, 201 insertions(+), 43 deletions(-)
+
+diff --git a/src/transformers/models/llama/modeling_llama.py b/src/transformers/models/llama/modeling_llama.py
+index 6b876614e..d85daee1a 100644
+--- a/src/transformers/models/llama/modeling_llama.py
++++ b/src/transformers/models/llama/modeling_llama.py
+@@ -24,6 +24,7 @@ import warnings
+ from typing import List, Optional, Tuple, Union
+ 
+ import torch
++import time
+ import torch.nn.functional as F
+ import torch.utils.checkpoint
+ from torch import nn
+@@ -317,6 +318,47 @@ class LlamaAttention(nn.Module):
+             else:
+                 raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+ 
++
++    def _apply_deleted_kv_context(
++        self,
++        key_states: torch.Tensor,
++        value_states: torch.Tensor,
++        attention_mask: Optional[torch.Tensor],
++    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
++        deleted_positions = getattr(self.config, "current_deleted_patches", None)
++        if deleted_positions is None:
++            return key_states, value_states, attention_mask
++
++        if torch.is_tensor(deleted_positions):
++            deleted_positions = deleted_positions.to(device=key_states.device, dtype=torch.long).flatten()
++        else:
++            deleted_positions = torch.tensor(deleted_positions, device=key_states.device, dtype=torch.long).flatten()
++
++        if deleted_positions.numel() == 0:
++            return key_states, value_states, attention_mask
++
++        kv_len = key_states.shape[-2]
++        deleted_positions = deleted_positions[(deleted_positions >= 0) & (deleted_positions < kv_len)]
++        if deleted_positions.numel() == 0:
++            return key_states, value_states, attention_mask
++
++        visible = torch.ones(kv_len, dtype=torch.bool, device=key_states.device)
++        visible[deleted_positions] = False
++        visible_idx = visible.nonzero(as_tuple=True)[0]
++        if visible_idx.numel() == kv_len:
++            return key_states, value_states, attention_mask
++
++        key_states = key_states.index_select(-2, visible_idx)
++        value_states = value_states.index_select(-2, visible_idx)
++
++        if attention_mask is not None:
++            if attention_mask.dim() == 4 and attention_mask.shape[-1] >= kv_len:
++                attention_mask = attention_mask[..., :kv_len].index_select(-1, visible_idx)
++            elif attention_mask.dim() == 2 and attention_mask.shape[-1] >= kv_len:
++                attention_mask = attention_mask[..., :kv_len].index_select(-1, visible_idx)
++
++        return key_states, value_states, attention_mask
++
+     def forward(
+         self,
+         hidden_states: torch.Tensor,
+@@ -365,6 +407,10 @@ class LlamaAttention(nn.Module):
+             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+ 
++        key_states, value_states, attention_mask = self._apply_deleted_kv_context(
++            key_states, value_states, attention_mask
++        )
++
+         key_states = repeat_kv(key_states, self.num_key_value_groups)
+         value_states = repeat_kv(value_states, self.num_key_value_groups)
+ 
+@@ -453,6 +499,10 @@ class LlamaFlashAttention2(LlamaAttention):
+             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+ 
++        key_states, value_states, attention_mask = self._apply_deleted_kv_context(
++            key_states, value_states, attention_mask
++        )
++
+         # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
+         # to be able to avoid many of these transpose/reshape/view.
+         query_states = query_states.transpose(1, 2)
+@@ -652,6 +702,10 @@ class LlamaSdpaAttention(LlamaAttention):
+             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+ 
++        key_states, value_states, attention_mask = self._apply_deleted_kv_context(
++            key_states, value_states, attention_mask
++        )
++
+         key_states = repeat_kv(key_states, self.num_key_value_groups)
+         value_states = repeat_kv(value_states, self.num_key_value_groups)
+ 
+@@ -936,6 +990,11 @@ class LlamaModel(LlamaPreTrainedModel):
+         self.all_FLOPs = 0
+         self.total_cuda_time = 0
+         self.num_forward = 0
++        self.warmup_steps = 20
++        self.total_wall_time = 0.0
++        self.prev_all_flops = 0
++        self.total_effective_flops = 0
++        self.warmup_flops = 0
+ 
+         # Initialize weights and apply final processing
+         self.post_init()
+@@ -1008,50 +1067,138 @@ class LlamaModel(LlamaPreTrainedModel):
+         all_hidden_states = () if output_hidden_states else None
+         all_self_attns = () #if output_attentions else None
+         next_decoder_cache = None
+-        last_reusable_patches = None
+-        
+-        
+-        start_event = torch.cuda.Event(enable_timing=True)
+-        end_event = torch.cuda.Event(enable_timing=True)
+-        
+-        torch.cuda.synchronize()
+-        start_event.record()
++        active_pruned_patches = None
++        active_deleted_patches = None
++        self.config.current_deleted_patches = None
++
++        timing_enabled = inputs_embeds.is_cuda and torch.cuda.is_available()
++        start_event = torch.cuda.Event(enable_timing=True) if timing_enabled else None
++        end_event = torch.cuda.Event(enable_timing=True) if timing_enabled else None
++        wall_start = time.time()
++
++        if timing_enabled:
++            torch.cuda.synchronize()
++            start_event.record()
++
++        def _empty_patch_tensor():
++            return torch.empty(0, device=inputs_embeds.device, dtype=torch.long)
++
++        def _select_layer_patches(patches, proportion):
++            if patches is None:
++                return _empty_patch_tensor()
++            if torch.is_tensor(patches):
++                patches = patches.to(device=inputs_embeds.device, dtype=torch.long).flatten()
++            else:
++                patches = torch.tensor(patches, device=inputs_embeds.device, dtype=torch.long).flatten()
++            if patches.numel() == 0:
++                return _empty_patch_tensor()
++            if torch.is_tensor(proportion):
++                proportion_value = float(proportion.detach().cpu())
++            else:
++                proportion_value = float(proportion)
++            proportion_value = max(0.0, min(proportion_value, 1.0))
++            top_k = int(proportion_value * patches.numel())
++            if proportion_value > 0.0 and top_k == 0:
++                top_k = 1
++            top_k = max(0, min(top_k, patches.numel()))
++            return patches[:top_k]
++
++        def _unique_cat(*parts):
++            parts = [p.to(device=inputs_embeds.device, dtype=torch.long).flatten() for p in parts if p is not None and p.numel() > 0]
++            if not parts:
++                return _empty_patch_tensor()
++            return torch.unique(torch.cat(parts, dim=0), sorted=True)
++
++        def _set_difference(values, excluded):
++            values = values.to(device=inputs_embeds.device, dtype=torch.long).flatten()
++            if values.numel() == 0:
++                return values
++            if excluded is None or excluded.numel() == 0:
++                return values
++            excluded = excluded.to(device=inputs_embeds.device, dtype=torch.long).flatten()
++            return values[~torch.isin(values, excluded)]
++
++        def _visible_kv_length(total_len, deleted_positions):
++            if deleted_positions is None or deleted_positions.numel() == 0:
++                return total_len
++            deleted_positions = deleted_positions.to(device=inputs_embeds.device, dtype=torch.long).flatten()
++            valid_deleted = deleted_positions[(deleted_positions >= 0) & (deleted_positions < total_len)]
++            if valid_deleted.numel() == 0:
++                return total_len
++            return total_len - torch.unique(valid_deleted).numel()
++
++        def _visible_kv_positions(total_len, deleted_positions):
++            positions = torch.arange(total_len, device=inputs_embeds.device, dtype=torch.long)
++            if deleted_positions is None or deleted_positions.numel() == 0:
++                return positions
++            deleted_positions = deleted_positions.to(device=inputs_embeds.device, dtype=torch.long).flatten()
++            valid_deleted = deleted_positions[(deleted_positions >= 0) & (deleted_positions < total_len)]
++            if valid_deleted.numel() == 0:
++                return positions
++            return positions[~torch.isin(positions, torch.unique(valid_deleted))]
+ 
+         for layer_idx, decoder_layer in enumerate(self.layers):
+-            
+-            if self.config.proportion_attn_var is not None and inputs_embeds.size(1) != 1 and layer_idx in self.pruning_loc:
+-                reusable_patches = self.config.reusable_patches
++            self.config.current_deleted_patches = active_deleted_patches
++
++            if self.config.proportion_attn_var is not None and layer_idx in self.pruning_loc:
++                reusable_patches = getattr(self.config, "reusable_patches", None)
++                deleted_patches = getattr(self.config, "deleted_patches", None)
+                 proportion = self.config.proportion_attn_var[layer_idx]
+-                top_k = max(1, int(proportion * len(reusable_patches)))
+-                selected_reusable_patches = reusable_patches[:top_k]
+-                
+-                if last_reusable_patches is None:
+-                    last_reusable_patches = selected_reusable_patches
+-
+-                if last_reusable_patches.size(0) <= selected_reusable_patches.size(0):
+-                    
+-                    dtype, device = inputs_embeds.dtype, inputs_embeds.device
+-                    bs,seq_length = inputs_embeds.shape[0], inputs_embeds.shape[1]
+-                    full_position = torch.arange(seq_length, device=inputs_embeds.device)
+-                    mask = ~torch.isin(cache_position, selected_reusable_patches)
+-                    new_cache_position = cache_position[mask]
+-                    new_cache_position, _ = new_cache_position.sort()
+-                    assert new_cache_position.size(0) + selected_reusable_patches.size(0) == seq_length, f"{new_cache_position.size(0)} + {selected_reusable_patches.size(0)} != {seq_length}"
+-                    
+-                    if causal_mask is not None:
+-                        causal_mask = causal_mask[..., mask, :]
+-                    hidden_states = hidden_states[..., mask, :]
+-                    position_ids = new_cache_position.unsqueeze(0)
+-                    
+-                    cache_position = new_cache_position
+-                    last_reusable_patches = selected_reusable_patches
++                selected_reusable_patches = _select_layer_patches(reusable_patches, proportion)
++                selected_deleted_patches = _select_layer_patches(deleted_patches, proportion)
++                selected_pruned_patches = torch.cat(
++                    [selected_reusable_patches, selected_deleted_patches], dim=0
++                )
++                if selected_pruned_patches.numel() > 0:
++                    selected_pruned_patches = torch.unique(selected_pruned_patches, sorted=True)
++
++                desired_pruned_patches = _unique_cat(active_pruned_patches, selected_pruned_patches)
++                new_pruned_patches = _set_difference(desired_pruned_patches, active_pruned_patches)
++                desired_deleted_patches = _unique_cat(active_deleted_patches, selected_deleted_patches)
++
++                if inputs_embeds.size(1) != 1 and new_pruned_patches.numel() > 0:
++                    new_pruned_patches = new_pruned_patches[torch.isin(new_pruned_patches, cache_position)]
++
++                    if new_pruned_patches.numel() > 0:
++                        seq_length = hidden_states.shape[-2]
++                        mask = ~torch.isin(cache_position, new_pruned_patches)
++                        new_cache_position = cache_position[mask]
++                        new_cache_position, _ = new_cache_position.sort()
++                        assert new_cache_position.size(0) + new_pruned_patches.size(0) == seq_length, (
++                            f"{new_cache_position.size(0)} + {new_pruned_patches.size(0)} != {seq_length}"
++                        )
++
++                        causal_rows_ok = (
++                            causal_mask is None
++                            or (causal_mask.dim() == 4 and causal_mask.shape[-2] == mask.numel())
++                        )
++                        if hidden_states.shape[-2] != mask.numel() or not causal_rows_ok:
++                            print(f"[LLaMA Reuse/Delete] skip prune layer={layer_idx} due to shape mismatch "
++                                  f"hs_seq={hidden_states.shape[-2]} mask={mask.numel()} "
++                                  f"causal={None if causal_mask is None else tuple(causal_mask.shape)}")
++                        else:
++                            if causal_mask is not None:
++                                # Reuse tokens stay visible as K/V context; only Q rows are removed here.
++                                # Delete columns are removed inside attention after the cache update.
++                                causal_mask = causal_mask[..., mask, :]
++                            hidden_states = hidden_states[..., mask, :]
++                            position_ids = new_cache_position.unsqueeze(0)
++                            cache_position = new_cache_position
++                            active_pruned_patches = _unique_cat(active_pruned_patches, new_pruned_patches)
++                            active_deleted_patches = desired_deleted_patches
++                            self.config.current_deleted_patches = active_deleted_patches
++                    else:
++                        active_pruned_patches = desired_pruned_patches
++                        active_deleted_patches = desired_deleted_patches
++                        self.config.current_deleted_patches = active_deleted_patches
+ 
+ 
+             if hidden_states.shape[1] !=1:     
+-                n = hidden_states.shape[1]                                  # token num
++                q_len = hidden_states.shape[1]                              # query token num
++                kv_len = _visible_kv_length(inputs_embeds.shape[1], active_deleted_patches)
+                 d = hidden_states.shape[2]                                  # hidden state size 
+                 m = self.layers[layer_idx].mlp.up_proj.out_features         # intermediate size of the FFN
+-                FLOPs_current = 4 * n * (d**2) + 2 *(n**2) * d + 3*n*d*m 
++                FLOPs_current = 4 * q_len * (d**2) + 2 * q_len * kv_len * d + 3 * q_len * d * m 
+                 self.all_FLOPs += FLOPs_current
+ 
+             if output_hidden_states:
+@@ -1087,18 +1234,29 @@ class LlamaModel(LlamaPreTrainedModel):
+             if output_attentions:
+                 all_self_attns += (layer_outputs[1],)
+         
+-        all_self_attns += (cache_position,)
+-        if hidden_states.shape[1] !=1:
++        self.config.current_deleted_patches = None
++
++        all_self_attns += (
++            (cache_position, _visible_kv_positions(inputs_embeds.shape[1], active_deleted_patches)),
++        )
++        if timing_enabled and hidden_states.shape[1] !=1:
+             end_event.record()
+             torch.cuda.synchronize() 
+             
+             cuda_time_current = start_event.elapsed_time(end_event)
+-            self.total_cuda_time += cuda_time_current
++            wall_ms = (time.time() - wall_start) * 1000.0
++            current_flops = self.all_FLOPs - self.prev_all_flops
++            self.prev_all_flops = self.all_FLOPs
+             self.num_forward += 1
+-
+-            FLOPs_avg_sample = (self.all_FLOPs / self.num_forward) * 1e-12
+-            cuda_time_avg = self.total_cuda_time / self.num_forward
+-            print(f"Current CUDA latency: {cuda_time_current:.6f} ms | Average CUDA latency: {cuda_time_avg:.6f} ms, Average TFLOPs: {FLOPs_avg_sample:.6f}")
++            if self.num_forward > self.warmup_steps:
++                self.total_cuda_time += cuda_time_current
++                self.total_wall_time += wall_ms
++                self.total_effective_flops += current_flops
++                steps = self.num_forward - self.warmup_steps
++                cuda_time_avg = self.total_cuda_time / steps
++                wall_avg = self.total_wall_time / steps
++                FLOPs_avg_sample = (self.total_effective_flops / steps) * 1e-12
++                print(f"[LLaMA Profile] Current CUDA latency: {cuda_time_current:.6f} ms (wall {wall_ms:.6f} ms) | Average CUDA latency: {cuda_time_avg:.6f} ms, Average wall: {wall_avg:.6f} ms, Average TFLOPs: {FLOPs_avg_sample:.6f}")
+     
+ 
+         hidden_states = self.norm(hidden_states)
+-- 
+2.34.1
+
