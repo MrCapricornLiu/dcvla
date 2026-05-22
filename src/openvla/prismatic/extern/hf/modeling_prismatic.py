@@ -29,6 +29,7 @@ from transformers import AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
 from .configuration_prismatic import OpenVLAConfig, PrismaticConfig
+from .llm_bucket_graph import BucketGraphRuntime, should_use_bucket_graph
 
 # Get Logger
 logger = logging.getLogger(__name__)
@@ -250,6 +251,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         self.language_model = AutoModelForCausalLM.from_config(
             config.text_config, attn_implementation=config._attn_implementation
         )
+        self._llm_bucket_graph_runtime = BucketGraphRuntime()
         self.vocab_size = config.text_config.vocab_size
         self.pad_token_id = config.pad_token_id
 
@@ -443,10 +445,8 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                 )
                 multimodal_labels = torch.cat([labels[:, :1], projected_patch_labels, labels[:, 1:]], dim=1)
 
-            # Dispatch to Language Model
-            language_model_output = self._timed_segment(
-                "llm",
-                lambda: self.language_model(
+            def _run_language_model_eager():
+                return self.language_model(
                     input_ids=None,
                     attention_mask=multimodal_attention_mask,
                     position_ids=None,
@@ -457,8 +457,43 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                     output_attentions=output_attentions,
                     output_hidden_states=output_hidden_states,
                     return_dict=return_dict,
-                ),
-            )
+                )
+
+            def _run_language_model_bucket_graph():
+                if not return_dict:
+                    return _run_language_model_eager()
+                if not should_use_bucket_graph(
+                    self,
+                    input_ids,
+                    multimodal_embeddings,
+                    past_key_values,
+                    multimodal_labels,
+                    use_cache,
+                ):
+                    return _run_language_model_eager()
+                try:
+                    return self._llm_bucket_graph_runtime.run(
+                        language_model=self.language_model,
+                        hidden_states=multimodal_embeddings,
+                        past_key_values=past_key_values,
+                        reusable_patches=getattr(self.language_model.config, "reusable_patches", None),
+                        deleted_patches=getattr(self.language_model.config, "deleted_patches", None),
+                        cache_effective=bool(getattr(self.language_model.config, "vla_cache_effective", True)),
+                        prune_effective=bool(getattr(self.language_model.config, "vla_delete_effective", True)),
+                        output_attentions=output_attentions,
+                        output_hidden_states=output_hidden_states,
+                        use_graph=bool(getattr(self.config, "llm_bucket_graph_capture", True)),
+                        graph_warmup=int(getattr(self.config, "llm_bucket_graph_warmup", 2)),
+                        max_graphs=int(getattr(self.config, "llm_bucket_graph_max_graphs", 32)),
+                    )
+                except Exception as exc:
+                    if not bool(getattr(self.config, "llm_bucket_graph_fallback", True)):
+                        raise
+                    logger.warning(f"LLM bucket graph path failed; falling back to eager LLM path: {exc!r}")
+                    return _run_language_model_eager()
+
+            # Dispatch to Language Model
+            language_model_output = self._timed_segment("llm", _run_language_model_bucket_graph)
 
         # === Otherwise =>> Assume Invalid! ===
         elif (input_ids.shape[0] != pixel_values.shape[0]) or (inputs_embeds.shape[0] != pixel_values.shape[0]):

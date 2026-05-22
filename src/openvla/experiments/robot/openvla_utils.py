@@ -216,8 +216,8 @@ def check_model_logic_mismatch(pretrained_checkpoint: str) -> None:
     """
     Check and sync model logic files between current code and checkpoint.
 
-    Handles the relationship between current and checkpoint versions of both
-    modeling_prismatic.py and configuration_prismatic.py:
+    Handles the relationship between current and checkpoint versions of
+    modeling_prismatic.py, configuration_prismatic.py, and local helper modules:
     - If checkpoint file exists and differs: creates backup and copies current version
     - If checkpoint file doesn't exist: copies current version
 
@@ -228,9 +228,14 @@ def check_model_logic_mismatch(pretrained_checkpoint: str) -> None:
         return
 
     # Find current files
-    curr_files = {"modeling_prismatic.py": None, "configuration_prismatic.py": None}
+    curr_files = {
+        "modeling_prismatic.py": None,
+        "configuration_prismatic.py": None,
+        "llm_bucket_graph.py": None,
+    }
 
-    for root, _, files in os.walk("./prismatic/"):
+    openvla_root = Path(__file__).resolve().parents[2]
+    for root, _, files in os.walk(openvla_root / "prismatic"):
         for filename in curr_files.keys():
             if filename in files and curr_files[filename] is None:
                 curr_files[filename] = os.path.join(root, filename)
@@ -446,6 +451,11 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
     vla.language_model.config.vla_cache_effective = bool(cfg.use_vla_cache)
     vla.language_model.config.vla_delete_effective = bool(getattr(cfg, "llm_delete_enable", False))
     vla.language_model.config.vla_overhead_benchmark = llm_overhead_benchmark
+    vla.config.llm_bucket_graph_enable = bool(getattr(cfg, "llm_bucket_graph_enable", False))
+    vla.config.llm_bucket_graph_capture = bool(getattr(cfg, "llm_bucket_graph_capture", True))
+    vla.config.llm_bucket_graph_warmup = int(getattr(cfg, "llm_bucket_graph_warmup", 2))
+    vla.config.llm_bucket_graph_max_graphs = int(getattr(cfg, "llm_bucket_graph_max_graphs", 32))
+    vla.config.llm_bucket_graph_fallback = bool(getattr(cfg, "llm_bucket_graph_fallback", True))
 
 
     # (If trained with image augmentations) Center crop image and then resize back up to original size.

@@ -103,6 +103,12 @@ class GenerateConfig:
     # EfficientVLA-style LLM-side visual token deletion. Disabled by default.
     llm_delete_enable: bool = False
     llm_delete_ratio: float = 0.0
+    # Experimental LLM fixed-bucket CUDA Graph backend for multimodal prefill.
+    llm_bucket_graph_enable: bool = False
+    llm_bucket_graph_capture: bool = True
+    llm_bucket_graph_warmup: int = 2
+    llm_bucket_graph_max_graphs: int = 32
+    llm_bucket_graph_fallback: bool = True
     
     #################################################################################################################
     # Model-specific parameters
