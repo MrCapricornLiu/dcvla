@@ -49,9 +49,59 @@ DATE = time.strftime("%Y_%m_%d")
 DATE_TIME = time.strftime("%Y_%m_%d-%H_%M_%S")
 DEVICE = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 OPENVLA_IMAGE_SIZE = 224  # Standard image size expected by OpenVLA
+LATENCY_SEGMENTS = ("overhead", "vit", "llm", "action_head")
 
 # Configure NumPy print settings
 np.set_printoptions(formatter={"float": lambda x: "{0:0.3f}".format(x)})
+
+
+def _latency_start():
+    use_cuda = torch.cuda.is_available()
+    start_event = torch.cuda.Event(enable_timing=True) if use_cuda else None
+    if use_cuda:
+        torch.cuda.synchronize()
+        start_event.record()
+    return time.perf_counter(), start_event, use_cuda
+
+
+def _latency_stop(timer_state):
+    wall_start, start_event, use_cuda = timer_state
+    if use_cuda:
+        end_event = torch.cuda.Event(enable_timing=True)
+        end_event.record()
+        torch.cuda.synchronize()
+        cuda_ms = start_event.elapsed_time(end_event)
+    else:
+        cuda_ms = 0.0
+    wall_ms = (time.perf_counter() - wall_start) * 1000.0
+    return wall_ms, cuda_ms
+
+
+def _finalize_latency_metrics(overhead_ms, overhead_cuda_ms, model_ms, model_cuda_ms, model_metrics):
+    metrics = {}
+    model_metrics = model_metrics or {}
+    for segment in LATENCY_SEGMENTS:
+        metrics[f"{segment}_wall_ms"] = float(model_metrics.get(f"{segment}_wall_ms", 0.0))
+        metrics[f"{segment}_cuda_ms"] = float(model_metrics.get(f"{segment}_cuda_ms", 0.0))
+
+    model_inner_wall_ms = sum(metrics[f"{segment}_wall_ms"] for segment in ("vit", "llm", "action_head"))
+    model_inner_cuda_ms = sum(metrics[f"{segment}_cuda_ms"] for segment in ("vit", "llm", "action_head"))
+    metrics["overhead_wall_ms"] = float(overhead_ms) + max(0.0, float(model_ms) - model_inner_wall_ms)
+    metrics["overhead_cuda_ms"] = float(overhead_cuda_ms) + max(0.0, float(model_cuda_ms) - model_inner_cuda_ms)
+    metrics["total_wall_ms"] = sum(metrics[f"{segment}_wall_ms"] for segment in LATENCY_SEGMENTS)
+    metrics["total_cuda_ms"] = sum(metrics[f"{segment}_cuda_ms"] for segment in LATENCY_SEGMENTS)
+    metrics["model_wall_ms"] = float(model_ms)
+    metrics["model_cuda_ms"] = float(model_cuda_ms)
+    return metrics
+
+
+def _format_latency_metrics(metrics):
+    return (
+        "[Latency] wall_ms total={total_wall_ms:.3f} overhead={overhead_wall_ms:.3f} "
+        "vit={vit_wall_ms:.3f} llm={llm_wall_ms:.3f} action_head={action_head_wall_ms:.3f} | "
+        "cuda_ms total={total_cuda_ms:.3f} overhead={overhead_cuda_ms:.3f} "
+        "vit={vit_cuda_ms:.3f} llm={llm_cuda_ms:.3f} action_head={action_head_cuda_ms:.3f}"
+    ).format(**metrics)
 
 
 def model_is_on_hf_hub(model_path: str) -> bool:
@@ -753,6 +803,8 @@ def get_vla_action(
     Returns:
         List[np.ndarray]: Predicted actions
     """
+    overhead_timer = _latency_start()
+
     # Collect all input images
     all_images = [obs["full_image"]]
     if cfg.num_images_in_input > 1:
@@ -770,14 +822,23 @@ def get_vla_action(
     vit_cache = last_caches.get("vit_cache") if last_caches is not None else None
 
     mask_indices_vit = None
+    mask_indices_delete_vit = None
     mask_indices_llm = None
     mask_indices_delete_llm = None
     remaining_static_tokens_primary = []
     remaining_static_tokens_wrist = []
+    delete_tokens_primary_vit = []
+    delete_tokens_wrist_vit = []
     vla.language_model.config.proportion_attn_var = None
     vla.language_model.config.reusable_patches = None
     vla.language_model.config.deleted_patches = None
     vla.language_model.config.current_deleted_patches = None
+    cache_overhead_benchmark = bool(getattr(cfg, "cache_overhead_benchmark", True))
+    vit_overhead_benchmark = cache_overhead_benchmark or bool(getattr(cfg, "vit_cache_benchmark", False))
+    llm_overhead_benchmark = cache_overhead_benchmark or bool(getattr(cfg, "llm_cache_benchmark", False))
+    vla.language_model.config.vla_cache_effective = bool(cfg.use_vla_cache)
+    vla.language_model.config.vla_delete_effective = bool(getattr(cfg, "llm_delete_enable", False))
+    vla.language_model.config.vla_overhead_benchmark = llm_overhead_benchmark
 
     # Always run ViT mask setup (benchmark or real cache)
     if True:
@@ -869,14 +930,25 @@ def get_vla_action(
 
             vit_attn_top_k = getattr(cfg, "vit_cache_attention_top_k", 120)
             llm_attn_top_k = _resolve_llm_param("attention_top_k", vit_attn_top_k)
-            llm_delete_ratio = getattr(cfg, "llm_delete_ratio", 0.0) if getattr(cfg, "llm_delete_enable", False) else 0.0
+            vit_delete_ratio = (
+                getattr(cfg, "vit_delete_ratio", 0.0)
+                if (getattr(cfg, "vit_delete_enable", False) or vit_overhead_benchmark)
+                else 0.0
+            )
+            llm_delete_ratio = (
+                getattr(cfg, "llm_delete_ratio", 0.0)
+                if (getattr(cfg, "llm_delete_enable", False) or llm_overhead_benchmark)
+                else 0.0
+            )
 
-            vis_primary, remaining_static_tokens_primary_vit = task_relevant_selection(
+            vis_primary, remaining_static_tokens_primary_vit, delete_tokens_primary_vit = task_relevant_selection(
                 prev_attn,
                 result_image[0],
                 stable_patches_primary_vit,
                 primary=True,
                 top_k=vit_attn_top_k,
+                delete_ratio=vit_delete_ratio,
+                return_delete=True,
             )
             _, remaining_static_tokens_primary_llm, delete_tokens_primary_llm = task_relevant_selection(
                 prev_attn,
@@ -888,12 +960,14 @@ def get_vla_action(
                 return_delete=True,
             )
             if len(result_image) > 1:
-                vis_wrist, remaining_static_tokens_wrist_vit = task_relevant_selection(
+                vis_wrist, remaining_static_tokens_wrist_vit, delete_tokens_wrist_vit = task_relevant_selection(
                     prev_attn,
                     result_image[1],
                     stable_patches_wrist_vit,
                     primary=False,
                     top_k=vit_attn_top_k,
+                    delete_ratio=vit_delete_ratio,
+                    return_delete=True,
                 )
                 _, remaining_static_tokens_wrist_llm, delete_tokens_wrist_llm = task_relevant_selection(
                     prev_attn,
@@ -907,25 +981,37 @@ def get_vla_action(
                 result_image = [vis_primary, vis_wrist]
             else:
                 remaining_static_tokens_wrist_vit = []
+                delete_tokens_wrist_vit = []
                 remaining_static_tokens_wrist_llm = []
                 delete_tokens_wrist_llm = []
                 result_image = [vis_primary]
 
-            final_static_token_indices_vit = (
-                remaining_static_tokens_primary_vit + remaining_static_tokens_wrist_vit
+            final_skip_token_indices_vit = (
+                remaining_static_tokens_primary_vit
+                + remaining_static_tokens_wrist_vit
+                + delete_tokens_primary_vit
+                + delete_tokens_wrist_vit
             )
             final_static_token_indices_llm = (
                 remaining_static_tokens_primary_llm + remaining_static_tokens_wrist_llm
             )
+            final_delete_token_indices_vit = (
+                delete_tokens_primary_vit + delete_tokens_wrist_vit
+            )
             final_delete_token_indices_llm = (
                 delete_tokens_primary_llm + delete_tokens_wrist_llm
             )
-            # Keep vit lists for downstream reuse mapping
+            # Keep ViT reuse lists for metrics; prune lists are mapped separately below.
             remaining_static_tokens_primary = remaining_static_tokens_primary_vit
             remaining_static_tokens_wrist = remaining_static_tokens_wrist_vit
             mask_indices_vit = (
-                torch.tensor(final_static_token_indices_vit, device=DEVICE)
-                if final_static_token_indices_vit
+                torch.tensor(final_skip_token_indices_vit, device=DEVICE)
+                if final_skip_token_indices_vit
+                else None
+            )
+            mask_indices_delete_vit = (
+                torch.tensor(final_delete_token_indices_vit, device=DEVICE)
+                if final_delete_token_indices_vit
                 else None
             )
             mask_indices_llm = (
@@ -939,13 +1025,13 @@ def get_vla_action(
                 else None
             )
 
-            if cfg.use_vla_cache:
+            if cfg.use_vla_cache or llm_overhead_benchmark:
                 vla.language_model.config.reusable_patches = mask_indices_llm
                 vla.language_model.config.deleted_patches = mask_indices_delete_llm
                 vla.language_model.config.proportion_attn_var = get_layer_mask_schedule(prev_attn)
 
-        if not cfg.use_vla_cache:
-            # honor flag: do not reuse LLaMA cache when VLA-Cache is off
+        if not cfg.use_vla_cache and not llm_overhead_benchmark:
+            # honor flag: do not reuse LLaMA cache when VLA-Cache is off and no overhead-control path is requested
             prompt_cache = None
             mask_indices_llm = None
 
@@ -963,23 +1049,40 @@ def get_vla_action(
     enable_vit = True  # always run ViT cache pipeline (benchmark or real reuse)
     if enable_vit:
         # Build ViT-side patch indices (per-image -> global) for reuse
-        if remaining_static_tokens_primary or remaining_static_tokens_wrist:
+        if (
+            remaining_static_tokens_primary
+            or remaining_static_tokens_wrist
+            or delete_tokens_primary_vit
+            or delete_tokens_wrist_vit
+        ):
             try:
                 num_patches = vla.vision_backbone.get_num_patches()
             except Exception:
                 num_patches = vla.vision_backbone.featurizer.patch_embed.num_patches
             vit_indices = []
+            vit_delete_indices = []
             for idx in remaining_static_tokens_primary:
                 patch_idx = idx - 1
                 if 0 <= patch_idx < num_patches:
                     vit_indices.append(patch_idx)
+            for idx in delete_tokens_primary_vit:
+                patch_idx = idx - 1
+                if 0 <= patch_idx < num_patches:
+                    vit_indices.append(patch_idx)
+                    vit_delete_indices.append(patch_idx)
             for idx in remaining_static_tokens_wrist:
                 patch_idx = idx - (1 + num_patches)
                 if 0 <= patch_idx < num_patches:
                     vit_indices.append(num_patches + patch_idx)
+            for idx in delete_tokens_wrist_vit:
+                patch_idx = idx - (1 + num_patches)
+                if 0 <= patch_idx < num_patches:
+                    vit_indices.append(num_patches + patch_idx)
+                    vit_delete_indices.append(num_patches + patch_idx)
             mask_indices_vit = torch.tensor(vit_indices, device=DEVICE) if vit_indices else None
+            mask_indices_delete_vit = torch.tensor(vit_delete_indices, device=DEVICE) if vit_delete_indices else None
 
-        def _prepare_featurizer(featurizer, cache_payload, mask_idx):
+        def _prepare_featurizer(featurizer, cache_payload, mask_idx, delete_idx):
             num_prefix = getattr(featurizer, "num_prefix_tokens", 0)
             num_patches = featurizer.patch_embed.num_patches
             try:
@@ -987,36 +1090,50 @@ def get_vla_action(
             except Exception:
                 num_images = cfg.num_images_in_input
             reuse_mask_local = torch.zeros(num_prefix + num_patches * num_images, dtype=torch.bool, device=DEVICE)
+            delete_mask_local = torch.zeros_like(reuse_mask_local)
             if mask_idx is not None:
                 valid_idx = mask_idx[(mask_idx >= 0) & (mask_idx < num_patches * num_images)]
                 reuse_mask_local[num_prefix + valid_idx] = True
+            if delete_idx is not None:
+                valid_delete_idx = delete_idx[(delete_idx >= 0) & (delete_idx < num_patches * num_images)]
+                delete_mask_local[num_prefix + valid_delete_idx] = True
+                reuse_mask_local[num_prefix + valid_delete_idx] = True
+            vit_cache_path_enabled = bool(cfg.use_vit_cache or vit_overhead_benchmark)
+            vit_static_reuse_effective = bool(cfg.use_vit_cache and getattr(cfg, "vit_cache_reuse", True))
+            vit_delete_effective = bool(cfg.use_vit_cache and getattr(cfg, "vit_delete_enable", False))
             # In benchmark mode we keep the internal featurizer cache within an episode but do not serialize it in last_caches.
-            if last_caches is None and cfg.use_vit_cache and hasattr(featurizer, "reset_vla_cache"):
+            if last_caches is None and vit_cache_path_enabled and hasattr(featurizer, "reset_vla_cache"):
                 featurizer.reset_vla_cache()
             use_cache_payload = (cache_payload is not None and cfg.use_vit_cache and not cfg.vit_cache_benchmark)
             if use_cache_payload:
                 cache_state = cache_payload
-            elif cfg.use_vit_cache and last_caches is not None:
+            elif vit_cache_path_enabled and last_caches is not None:
                 cache_state = featurizer.get_vla_cache_state()
             else:
                 cache_state = [None] * len(featurizer.blocks)
             featurizer.set_vla_cache_state(
                 cache_state,
                 reuse_mask_local,
-                enable_reuse=cfg.use_vit_cache,
-                enable_static_reuse=getattr(cfg, "vit_cache_reuse", True),
+                enable_reuse=vit_cache_path_enabled,
+                enable_static_reuse=vit_static_reuse_effective,
                 keyframe_interval=getattr(cfg, "vit_cache_keyframe_interval", 0),
+                delete_mask=delete_mask_local if (getattr(cfg, "vit_delete_enable", False) or vit_overhead_benchmark) else None,
+                enable_delete=vit_delete_effective,
+                overhead_benchmark=vit_overhead_benchmark,
             )
             static_count = reuse_mask_local.sum().item()
+            delete_count = delete_mask_local.sum().item()
             total_count = reuse_mask_local.numel()
             ratio = static_count / max(1, total_count)
-            print(f"[ViT Reuse] static={static_count}/{total_count} ({ratio:.3f})")
+            delete_ratio = delete_count / max(1, total_count)
+            print(f"[ViT Reuse] skip={static_count}/{total_count} ({ratio:.3f}) prune={delete_count}/{total_count} ({delete_ratio:.3f})")
             return reuse_mask_local
 
         _prepare_featurizer(
             vla.vision_backbone.featurizer,
             None if vit_cache is None else vit_cache.get("alpha"),
             mask_indices_vit,
+            mask_indices_delete_vit,
         )
 
         if getattr(vla.vision_backbone, "use_fused_vision_backbone", False):
@@ -1024,6 +1141,7 @@ def get_vla_action(
                 vla.vision_backbone.fused_featurizer,
                 None if vit_cache is None else vit_cache.get("beta"),
                 mask_indices_vit,
+                mask_indices_delete_vit,
             )
     else:
         if hasattr(vla.vision_backbone.featurizer, "reset_vla_cache"):
@@ -1059,9 +1177,8 @@ def get_vla_action(
         obs["state"] = normalize_proprio(proprio, proprio_norm_stats)
         proprio = obs["state"]
 
-    # Start timer
-    start_time = time.time()
-    metrics = {}
+    overhead_wall_ms, overhead_cuda_ms = _latency_stop(overhead_timer)
+    model_timer = _latency_start()
     # Generate action
     if action_head is None:
         # Standard VLA output (single-image inputs, discrete actions)
@@ -1079,24 +1196,34 @@ def get_vla_action(
             use_film=use_film,
             past_key_values=prompt_cache,
         )
-        # Collect ViT cache for next frame
-        if cfg.use_vit_cache and not cfg.vit_cache_benchmark and last_caches is not None:
-            vit_cache_out = {
-                "alpha": vla.vision_backbone.featurizer.get_vla_cache_state()
-            }
-            if getattr(vla.vision_backbone, "use_fused_vision_backbone", False):
-                vit_cache_out["beta"] = vla.vision_backbone.fused_featurizer.get_vla_cache_state()
-            last_caches["vit_cache"] = vit_cache_out
-    # End timer
-    end_time = time.time()
-    time_elapsed = end_time - start_time
-    metrics.update({"time_elapsed": time_elapsed})
-    metrics.update({"num_static_tokens_primary": len(remaining_static_tokens_primary) if mask_indices_vit is not None else 0})
-    metrics.update({"num_static_tokens_wrist": len(remaining_static_tokens_wrist) if mask_indices_vit is not None else 0})
-    
+    model_wall_ms, model_cuda_ms = _latency_stop(model_timer)
+
+    post_overhead_timer = _latency_start()
+    # Collect ViT cache for next frame
+    if cfg.use_vit_cache and not cfg.vit_cache_benchmark and last_caches is not None:
+        vit_cache_out = {
+            "alpha": vla.vision_backbone.featurizer.get_vla_cache_state()
+        }
+        if getattr(vla.vision_backbone, "use_fused_vision_backbone", False):
+            vit_cache_out["beta"] = vla.vision_backbone.fused_featurizer.get_vla_cache_state()
+        last_caches["vit_cache"] = vit_cache_out
+
     # Extract subset of actions for open loop steps
     action_list = [action[i] for i in range(min(len(action), cfg.num_open_loop_steps))]
     result_image = [np.array(image) for image in result_image]
+    post_overhead_wall_ms, post_overhead_cuda_ms = _latency_stop(post_overhead_timer)
+
+    metrics = _finalize_latency_metrics(
+        overhead_wall_ms + post_overhead_wall_ms,
+        overhead_cuda_ms + post_overhead_cuda_ms,
+        model_wall_ms,
+        model_cuda_ms,
+        getattr(vla, "_vla_latency_metrics", None),
+    )
+    print(_format_latency_metrics(metrics))
+    metrics.update({"time_elapsed": metrics["total_wall_ms"] / 1000.0})
+    metrics.update({"num_static_tokens_primary": len(remaining_static_tokens_primary) if mask_indices_vit is not None else 0})
+    metrics.update({"num_static_tokens_wrist": len(remaining_static_tokens_wrist) if mask_indices_vit is not None else 0})
     return action_list, last_caches, result_image, metrics
 
 

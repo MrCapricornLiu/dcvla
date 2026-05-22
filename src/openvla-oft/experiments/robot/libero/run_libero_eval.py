@@ -100,6 +100,8 @@ class GenerateConfig:
     vit_cache_reuse: bool = True
     vit_cache_standalone: bool = False
     vit_cache_benchmark: bool = True
+    cache_overhead_benchmark: bool = True
+    llm_cache_benchmark: bool = True
     vit_cache_keyframe_interval: int = 0
     vit_cache_patch_metric: str = "cosine"
     vit_cache_patch_diff_threshold: float = 0.1
@@ -108,6 +110,9 @@ class GenerateConfig:
     vit_cache_sim_threshold: float = 0.996
     vit_cache_attention_top_k: int = 120
     vit_cache_static_top_k: int = 130
+    # ViT-side visual token pruning; pruned tokens skip recompute and are hidden from ViT attention K/V.
+    vit_delete_enable: bool = False
+    vit_delete_ratio: float = 0.0
     # Optional: LLM-side mask parameters (fallback to vit_cache_* when None)
     llm_cache_patch_metric: Optional[str] = None
     llm_cache_patch_diff_threshold: Optional[float] = None
@@ -360,6 +365,7 @@ def run_episode(
     episode_step = 0
     episode_task_static_tokens_primary = 0
     episode_task_static_tokens_wrist = 0
+    episode_latency_totals = {}
     
     # Run episode
     success = False
@@ -406,6 +412,9 @@ def run_episode(
                 episode_step += 1
                 episode_task_static_tokens_primary += metrics['num_static_tokens_primary']
                 episode_task_static_tokens_wrist += metrics['num_static_tokens_wrist']
+                for key, value in metrics.items():
+                    if key.endswith("_ms"):
+                        episode_latency_totals[key] = episode_latency_totals.get(key, 0.0) + float(value)
                 
                 action_queue.extend(actions)
                 replay_images_heatmap.append(result_image[0])
@@ -432,7 +441,8 @@ def run_episode(
         "episode_time": episode_time,
         "episode_step": episode_step,
         "episode_task_static_tokens_primary": episode_task_static_tokens_primary,
-        "episode_task_static_tokens_wrist": episode_task_static_tokens_wrist
+        "episode_task_static_tokens_wrist": episode_task_static_tokens_wrist,
+        "episode_latency_totals": episode_latency_totals,
     }
 
     return success, replay_images_heatmap, replay_images_wrist_heatmap, eposode_metrics
@@ -468,6 +478,7 @@ def run_task(
     total_time = 0
     total_task_static_tokens_primary = 0
     total_task_static_tokens_wrist = 0
+    total_latency_totals = {}
     
     for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
         log_message(f"\nTask: {task_description}", log_file)
@@ -510,6 +521,8 @@ def run_task(
         total_time += eposode_metrics["episode_time"]
         total_task_static_tokens_primary += eposode_metrics["episode_task_static_tokens_primary"]
         total_task_static_tokens_wrist += eposode_metrics["episode_task_static_tokens_wrist"]
+        for key, value in eposode_metrics["episode_latency_totals"].items():
+            total_latency_totals[key] = total_latency_totals.get(key, 0.0) + float(value)
         
         if total_steps > 0 and total_time > 0:
             avg_step_ms = (total_time / total_steps) * 1000.0
@@ -520,6 +533,17 @@ def run_task(
                 f"Average time per step: {avg_step_ms:.4f} ms, Control Frequency: {ctrl_hz:.2f} Hz, "
                 f"Token Reusing Ratio (Primary): {reuse_primary:.2f} %, Token Reusing Ratio (Wrist): {reuse_wrist:.2f} %"
             )
+            latency_avg = {key: value / total_steps for key, value in total_latency_totals.items()}
+            latency_msg = (
+                "[Latency Avg] wall_ms total={total_wall_ms:.3f} overhead={overhead_wall_ms:.3f} "
+                "vit={vit_wall_ms:.3f} llm={llm_wall_ms:.3f} action_head={action_head_wall_ms:.3f} | "
+                "cuda_ms total={total_cuda_ms:.3f} overhead={overhead_cuda_ms:.3f} "
+                "vit={vit_cuda_ms:.3f} llm={llm_cuda_ms:.3f} action_head={action_head_cuda_ms:.3f}"
+            ).format(**latency_avg)
+            print(latency_msg)
+            if log_file:
+                log_file.write(latency_msg + "\n")
+                log_file.flush()
         else:
             print("Average time per step: n/a (no steps or time recorded yet)")
 

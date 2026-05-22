@@ -222,6 +222,8 @@ nohup.out
 # Experiment launch scripts are intentionally versioned for reproducible runs.
 !scripts/
 !scripts/**
+scripts/**/__pycache__/
+scripts/**/*.py[cod]
 !scripts_openvla/
 !scripts_openvla/**
 !scripts_openvla_oft/

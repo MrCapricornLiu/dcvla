@@ -7,6 +7,7 @@ but exactly replicate the logic in `prismatic.models.vlms.prismatic.py`.
 """
 
 import logging
+import time
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple, Union
@@ -360,6 +361,40 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         # HF Boilerplate =>> initializes weights via `_init_weights()` and sets gradient checkpointing
         self.post_init()
 
+    def _reset_latency_metrics(self) -> None:
+        self._vla_latency_metrics = {
+            "vit_wall_ms": 0.0,
+            "vit_cuda_ms": 0.0,
+            "llm_wall_ms": 0.0,
+            "llm_cuda_ms": 0.0,
+            "action_head_wall_ms": 0.0,
+            "action_head_cuda_ms": 0.0,
+        }
+
+    def _timed_segment(self, name: str, fn: Callable[[], Any]) -> Any:
+        metrics = getattr(self, "_vla_latency_metrics", None)
+        if metrics is None:
+            return fn()
+
+        use_cuda = torch.cuda.is_available()
+        start_event = torch.cuda.Event(enable_timing=True) if use_cuda else None
+        end_event = torch.cuda.Event(enable_timing=True) if use_cuda else None
+        if use_cuda:
+            torch.cuda.synchronize()
+            start_event.record()
+        wall_start = time.perf_counter()
+        result = fn()
+        if use_cuda:
+            end_event.record()
+            torch.cuda.synchronize()
+            cuda_ms = start_event.elapsed_time(end_event)
+        else:
+            cuda_ms = 0.0
+        wall_ms = (time.perf_counter() - wall_start) * 1000.0
+        metrics[f"{name}_wall_ms"] = metrics.get(f"{name}_wall_ms", 0.0) + wall_ms
+        metrics[f"{name}_cuda_ms"] = metrics.get(f"{name}_cuda_ms", 0.0) + cuda_ms
+        return result
+
     # === `PreTrainedModel` Boilerplate ===
     def get_input_embeddings(self) -> nn.Module:
         return self.language_model.get_input_embeddings()
@@ -537,17 +572,20 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             assert past_key_values is not None, "You must provide `past_key_values` during cached generation!"
             assert labels is None, "Unexpected key `labels` provided during cached generation!"
 
-            language_model_output = self.language_model(
-                input_ids=input_ids,
-                attention_mask=None,
-                position_ids=None,
-                past_key_values=past_key_values,
-                inputs_embeds=None,
-                labels=None,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
+            language_model_output = self._timed_segment(
+                "llm",
+                lambda: self.language_model(
+                    input_ids=input_ids,
+                    attention_mask=None,
+                    position_ids=None,
+                    past_key_values=past_key_values,
+                    inputs_embeds=None,
+                    labels=None,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict,
+                ),
             )
 
         # === Handle Unimodal Forward ===
@@ -555,17 +593,20 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             assert (input_ids is not None) and (inputs_embeds is None), "Missing `input_ids` in language-only forward!"
             assert past_key_values is None, "Unexpected key `past_key_values` provided during language-only forward!"
 
-            language_model_output = self.language_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=None,
-                past_key_values=None,
-                inputs_embeds=None,
-                labels=labels,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
+            language_model_output = self._timed_segment(
+                "llm",
+                lambda: self.language_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=None,
+                    past_key_values=None,
+                    inputs_embeds=None,
+                    labels=labels,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict,
+                ),
             )
 
         # === Handle Multimodal Forward ===
@@ -584,7 +625,10 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             )  # (B, lang_seq_len, llm_dim)
 
             # Get visual features
-            projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+            projected_patch_embeddings = self._timed_segment(
+                "vit",
+                lambda: self._process_vision_features(pixel_values, language_embeddings, use_film),
+            )
 
             # Add proprioceptive state if provided
             projected_patch_embeddings = self._process_proprio_features(
@@ -630,17 +674,20 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             multimodal_labels = self._build_multimodal_labels(labels, projected_patch_embeddings)
 
             # Dispatch to language model
-            language_model_output = self.language_model(
-                input_ids=None,
-                attention_mask=multimodal_attention_mask,
-                position_ids=None,
-                past_key_values=None,
-                inputs_embeds=multimodal_embeddings,
-                labels=multimodal_labels,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
+            language_model_output = self._timed_segment(
+                "llm",
+                lambda: self.language_model(
+                    input_ids=None,
+                    attention_mask=multimodal_attention_mask,
+                    position_ids=None,
+                    past_key_values=None,
+                    inputs_embeds=multimodal_embeddings,
+                    labels=multimodal_labels,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict,
+                ),
             )
 
         # === Otherwise =>> Assume Invalid! ===
@@ -845,17 +892,20 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             )
 
             # Forward pass through language model
-            language_model_output = self.language_model(
-                input_ids=None,
-                attention_mask=multimodal_attention_mask,
-                position_ids=None,
-                past_key_values=None,
-                inputs_embeds=multimodal_embeddings,
-                labels=None,
-                use_cache=None,
-                output_attentions=False,
-                output_hidden_states=True,
-                return_dict=True,
+            language_model_output = self._timed_segment(
+                "llm",
+                lambda: self.language_model(
+                    input_ids=None,
+                    attention_mask=multimodal_attention_mask,
+                    position_ids=None,
+                    past_key_values=None,
+                    inputs_embeds=multimodal_embeddings,
+                    labels=None,
+                    use_cache=None,
+                    output_attentions=False,
+                    output_hidden_states=True,
+                    return_dict=True,
+                ),
             )
 
             # Extract hidden states for action portion of response
@@ -867,8 +917,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             ]  # (B, act_chunk_len, D)
 
             # Predict noise and update noisy actions: x_t -> x_{t-1}
-            noise_pred = action_head.predict_noise(actions_hidden_states)
-            curr_noisy_actions = action_head.noise_scheduler.step(noise_pred, t, curr_noisy_actions).prev_sample
+            def _run_action_head_step():
+                noise_pred = action_head.predict_noise(actions_hidden_states)
+                return action_head.noise_scheduler.step(noise_pred, t, curr_noisy_actions).prev_sample
+
+            curr_noisy_actions = self._timed_segment("action_head", _run_action_head_step)
 
         curr_noisy_actions = curr_noisy_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
 
@@ -901,17 +954,20 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         )
         
         # Forward pass through language model
-        language_model_output = self.language_model(
-            input_ids=None,
-            attention_mask=multimodal_attention_mask,
-            position_ids=None,
-            past_key_values=past_key_values,
-            inputs_embeds=multimodal_embeddings,
-            labels=None,
-            use_cache=True,
-            output_attentions=True,
-            output_hidden_states=True,
-            return_dict=True,
+        language_model_output = self._timed_segment(
+            "llm",
+            lambda: self.language_model(
+                input_ids=None,
+                attention_mask=multimodal_attention_mask,
+                position_ids=None,
+                past_key_values=past_key_values,
+                inputs_embeds=multimodal_embeddings,
+                labels=None,
+                use_cache=True,
+                output_attentions=True,
+                output_hidden_states=True,
+                return_dict=True,
+            ),
         )
 
         # Extract hidden states for action tokens
@@ -924,13 +980,12 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         last_caches = {"past_key_values": language_model_output.past_key_values, "attentions": language_model_output.attentions}
 
         # Handle different prediction methods
-        if action_head is not None:
-            # L1 regression prediction
-            normalized_actions = action_head.predict_action(actions_hidden_states)
-            normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
-            normalized_actions = normalized_actions.float().cpu().detach().numpy()
-        else:
-            # Discrete token-based prediction
+        def _predict_normalized_actions():
+            if action_head is not None:
+                normalized = action_head.predict_action(actions_hidden_states)
+                normalized = normalized.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
+                return normalized.float().cpu().detach().numpy()
+
             predicted_action_token_ids = (
                 language_model_output.logits[
                     :,
@@ -942,8 +997,10 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             )
             discretized_actions = self.vocab_size - predicted_action_token_ids
             discretized_actions = np.clip(discretized_actions - 1, a_min=0, a_max=self.bin_centers.shape[0] - 1)
-            normalized_actions = self.bin_centers[discretized_actions]
-            normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
+            normalized = self.bin_centers[discretized_actions]
+            return normalized.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
+
+        normalized_actions = self._timed_segment("action_head", _predict_normalized_actions)
 
         return normalized_actions, actions_hidden_states, last_caches
 
@@ -974,6 +1031,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         Returns:
             Tuple of (unnormalized_actions, action_hidden_states)
         """
+        self._reset_latency_metrics()
+
         # If the special empty token ('') does not already appear after the colon (':') token in the prompt
         # (after "OUT:" or "ASSISTANT:"), insert it to match the inputs seen at training time
         if not torch.all(input_ids[:, -1] == 29871):
@@ -1007,7 +1066,10 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         )
 
         # Process vision features
-        projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+        projected_patch_embeddings = self._timed_segment(
+            "vit",
+            lambda: self._process_vision_features(pixel_values, language_embeddings, use_film),
+        )
 
         # Add proprioceptive features if provided
         use_proprio = proprio_projector is not None and proprio is not None
@@ -1061,7 +1123,10 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             )
 
         # Unnormalize predicted actions
-        actions = self._unnormalize_actions(normalized_actions, unnorm_key)
+        actions = self._timed_segment(
+            "action_head",
+            lambda: self._unnormalize_actions(normalized_actions, unnorm_key),
+        )
 
         return actions, actions_hidden_states, last_caches
 

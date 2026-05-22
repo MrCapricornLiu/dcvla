@@ -52,7 +52,35 @@ __all__ = ['VisionTransformer']  # model_registry will add each entrypoint fn to
 
 _logger = logging.getLogger(__name__)
 _debug_vit = os.environ.get("VLA_VIT_DEBUG", "0") == "1"
-_time_vit = True  # always profile unless explicitly disabled in code
+_time_vit = os.environ.get("VLA_VIT_BLOCK_PROFILE", "0") == "1"
+_detail_time_vit = os.environ.get("VLA_VIT_DETAIL_PROFILE", "0") == "1"
+
+
+def _vla_detail_add(parent, key: str, value: float) -> None:
+    if parent is None or not getattr(parent, "_vla_detail_profile_enabled", False):
+        return
+    stats = getattr(parent, "_vla_detail_step_stats", None)
+    if stats is None:
+        return
+    stats[key] = stats.get(key, 0.0) + float(value)
+
+
+def _vla_detail_time(parent, key: str, fn):
+    if (
+        parent is None
+        or not getattr(parent, "_vla_detail_profile_enabled", False)
+        or not torch.cuda.is_available()
+    ):
+        return fn()
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    torch.cuda.synchronize()
+    start_event.record()
+    result = fn()
+    end_event.record()
+    torch.cuda.synchronize()
+    _vla_detail_add(parent, key, start_event.elapsed_time(end_event))
+    return result
 
 
 class VitBlockCache:
@@ -82,20 +110,28 @@ class VitCacheContext:
     def __init__(
             self,
             reuse_mask: Optional[torch.Tensor],
+            delete_mask: Optional[torch.Tensor],
             cache: Optional[VitBlockCache],
             cache_container: Optional[List[Optional[VitBlockCache]]],
             cache_index: Optional[int],
             cache_enabled: bool,
             static_reuse_enabled: bool,
+            delete_enabled: bool,
+            overhead_benchmark: bool,
             force_keyframe: bool = False,
+            parent=None,
     ):
         self.reuse_mask = reuse_mask
+        self.delete_mask = delete_mask
         self.cache = cache
         self.cache_container = cache_container
         self.cache_index = cache_index
         self.cache_enabled = cache_enabled
         self.static_reuse_enabled = static_reuse_enabled
+        self.delete_enabled = delete_enabled
+        self.overhead_benchmark = overhead_benchmark
         self.force_keyframe = force_keyframe
+        self.parent = parent
 
 
 class Attention(nn.Module):
@@ -131,17 +167,86 @@ class Attention(nn.Module):
     def set_cache_context(self, ctx: Optional[VitCacheContext]):
         self._vla_ctx = ctx
 
+    def forward_reuse_compact(
+            self,
+            x_dyn: torch.Tensor,
+            dynamic_idx: torch.Tensor,
+            seq_len: int,
+            cache: VitBlockCache,
+            visible_kv_idx: torch.Tensor,
+            pruned_idx: torch.Tensor,
+            profile_parent=None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run the ViT reuse attention path on a compact dynamic-token stream."""
+        B, D, C = x_dyn.shape
+        qkv_dyn = _vla_detail_time(
+            profile_parent,
+            "attn_reuse_qkv_ms",
+            lambda: self.qkv(x_dyn).reshape(B, D, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4),
+        )
+        q_dyn, k_dyn, v_dyn = qkv_dyn.unbind(0)
+        q_dyn, k_dyn = self.q_norm(q_dyn), self.k_norm(k_dyn)
+        _vla_detail_time(
+            profile_parent,
+            "attn_reuse_cache_update_ms",
+            lambda: cache.update(dynamic_idx, k_dyn, v_dyn),
+        )
+
+        if pruned_idx.numel() > 0:
+            k_ctx = cache.k.index_select(2, visible_kv_idx)
+            v_ctx = cache.v.index_select(2, visible_kv_idx)
+        else:
+            k_ctx = cache.k
+            v_ctx = cache.v
+
+        if self.fused_attn:
+            out_dyn = _vla_detail_time(
+                profile_parent,
+                "attn_reuse_attention_ms",
+                lambda: F.scaled_dot_product_attention(
+                    q_dyn, k_ctx, v_ctx,
+                    dropout_p=self.attn_drop.p if self.training else 0.,
+                ),
+            )
+        else:
+            def _manual_reuse_attention():
+                q_scaled = q_dyn * self.scale
+                attn = q_scaled @ k_ctx.transpose(-2, -1)
+                attn = attn.softmax(dim=-1)
+                attn = self.attn_drop(attn)
+                return attn @ v_ctx
+
+            out_dyn = _vla_detail_time(profile_parent, "attn_reuse_attention_ms", _manual_reuse_attention)
+
+        def _reuse_project_update():
+            attn_dyn_local = out_dyn.transpose(1, 2).reshape(B, D, C)
+            if cache.attn_out is None or cache.attn_out.shape != (B, seq_len, C):
+                cache.attn_out = x_dyn.new_zeros(B, seq_len, C)
+            if cache.attn_proj is None or cache.attn_proj.shape != (B, seq_len, C):
+                cache.attn_proj = x_dyn.new_zeros(B, seq_len, C)
+            proj_dyn_local = self.proj(attn_dyn_local)
+            proj_dyn_local = self.proj_drop(proj_dyn_local)
+            cache.attn_out.index_copy_(1, dynamic_idx, attn_dyn_local)
+            cache.attn_proj.index_copy_(1, dynamic_idx, proj_dyn_local)
+            return proj_dyn_local, attn_dyn_local
+
+        return _vla_detail_time(profile_parent, "attn_reuse_project_scatter_ms", _reuse_project_update)
+
     def forward(self, x: torch.Tensor):
         B, N, C = x.shape
 
         ctx = getattr(self, "_vla_ctx", None)
         reuse_mask = ctx.reuse_mask if ctx is not None else None
+        delete_mask = ctx.delete_mask if ctx is not None else None
         cache = ctx.cache if ctx is not None else None
         cache_container = ctx.cache_container if ctx is not None else None
         cache_index = ctx.cache_index if ctx is not None else None
         cache_enabled = ctx.cache_enabled if ctx is not None else False
         static_reuse_enabled = ctx.static_reuse_enabled if ctx is not None else False
+        delete_enabled = ctx.delete_enabled if ctx is not None else False
+        overhead_benchmark = ctx.overhead_benchmark if ctx is not None else False
         force_keyframe = ctx.force_keyframe if ctx is not None else False
+        profile_parent = ctx.parent if ctx is not None else None
 
         def _project_q(all_tokens: torch.Tensor) -> torch.Tensor:
             B_local, N_local, _ = all_tokens.shape
@@ -173,6 +278,10 @@ class Attention(nn.Module):
             and cache_container is not None
             and cache_index is not None
             and reuse_mask.dtype == torch.bool
+            and (
+                delete_mask is None
+                or (delete_mask.numel() == N and delete_mask.dtype == torch.bool)
+            )
         )
 
         # Lazily create cache on first use so full path can populate it
@@ -194,39 +303,92 @@ class Attention(nn.Module):
         if reuse_ok:
             # When static reuse is disabled, treat all tokens as dynamic but still follow the split path to match overhead.
             effective_static = reuse_mask if static_reuse_enabled else torch.zeros_like(reuse_mask, dtype=torch.bool)
+            if static_reuse_enabled and delete_enabled and delete_mask is not None:
+                # Pruned tokens are a subset of static/reused tokens: they skip Q/MLP and are hidden from K/V context.
+                effective_delete = delete_mask & effective_static
+            else:
+                effective_delete = torch.zeros_like(effective_static, dtype=torch.bool)
+            bookkeeping_delete = (
+                (delete_mask & reuse_mask)
+                if overhead_benchmark and delete_mask is not None
+                else effective_delete
+            )
             dynamic_idx = (~effective_static).nonzero(as_tuple=True)[0]
             static_idx = effective_static.nonzero(as_tuple=True)[0]
+            visible_kv_idx = (~effective_delete).nonzero(as_tuple=True)[0]
+            pruned_idx = effective_delete.nonzero(as_tuple=True)[0]
+            bookkeeping_visible_kv_idx = (~bookkeeping_delete).nonzero(as_tuple=True)[0]
+            bookkeeping_pruned_idx = bookkeeping_delete.nonzero(as_tuple=True)[0]
+            _vla_detail_add(profile_parent, "attn_reuse_calls", 1)
+            _vla_detail_add(profile_parent, "attn_reuse_dynamic_tokens", dynamic_idx.numel())
+            _vla_detail_add(profile_parent, "attn_reuse_static_tokens", static_idx.numel())
+            _vla_detail_add(profile_parent, "attn_pruned_kv_tokens", bookkeeping_pruned_idx.numel())
 
-            # Compute Q/K/V for dynamic tokens once, update K/V cache, and run dynamic queries over full cached K/V.
+            # Compute Q/K/V for dynamic tokens once, update K/V cache, and run dynamic queries over visible cached K/V.
             if dynamic_idx.numel() > 0:
-                qkv_dyn = self.qkv(x[:, dynamic_idx, :]).reshape(B, dynamic_idx.numel(), 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+                qkv_dyn = _vla_detail_time(
+                    profile_parent,
+                    "attn_reuse_qkv_ms",
+                    lambda: self.qkv(x[:, dynamic_idx, :]).reshape(
+                        B, dynamic_idx.numel(), 3, self.num_heads, self.head_dim
+                    ).permute(2, 0, 3, 1, 4),
+                )
                 q_dyn, k_dyn, v_dyn = qkv_dyn.unbind(0)
                 q_dyn, k_dyn = self.q_norm(q_dyn), self.k_norm(k_dyn)
-                cache.update(dynamic_idx, k_dyn, v_dyn)
+                _vla_detail_time(
+                    profile_parent,
+                    "attn_reuse_cache_update_ms",
+                    lambda: cache.update(dynamic_idx, k_dyn, v_dyn),
+                )
+                if overhead_benchmark and bookkeeping_pruned_idx.numel() > 0 and pruned_idx.numel() == 0:
+                    _ = cache.k.index_select(2, bookkeeping_visible_kv_idx)
+                    _ = cache.v.index_select(2, bookkeeping_visible_kv_idx)
+                if pruned_idx.numel() > 0:
+                    k_ctx = cache.k.index_select(2, visible_kv_idx)
+                    v_ctx = cache.v.index_select(2, visible_kv_idx)
+                else:
+                    k_ctx = cache.k
+                    v_ctx = cache.v
                 if self.fused_attn:
-                    out_dyn = F.scaled_dot_product_attention(
-                        q_dyn, cache.k, cache.v,
-                        dropout_p=self.attn_drop.p if self.training else 0.,
+                    out_dyn = _vla_detail_time(
+                        profile_parent,
+                        "attn_reuse_attention_ms",
+                        lambda: F.scaled_dot_product_attention(
+                            q_dyn, k_ctx, v_ctx,
+                            dropout_p=self.attn_drop.p if self.training else 0.,
+                        ),
                     )
                 else:
-                    q_dyn = q_dyn * self.scale
-                    attn = q_dyn @ cache.k.transpose(-2, -1)
-                    attn = attn.softmax(dim=-1)
-                    attn = self.attn_drop(attn)
-                    out_dyn = attn @ cache.v
-                attn_dyn = out_dyn.transpose(1, 2).reshape(B, dynamic_idx.numel(), C)
-                # Prepare/reuse buffers
-                if cache.attn_out is None or cache.attn_out.shape[1] != N:
-                    cache.attn_out = x.new_zeros(B, N, C)
-                if cache.attn_proj is None or cache.attn_proj.shape[1] != N:
-                    cache.attn_proj = x.new_zeros(B, N, C)
-                attn_full = cache.attn_out
-                proj_full = cache.attn_proj
-                # Static slices already in cache; dynamic slices freshly computed
-                attn_full.index_copy_(1, dynamic_idx, attn_dyn)
-                proj_dyn = self.proj(attn_dyn)
-                proj_dyn = self.proj_drop(proj_dyn)
-                proj_full.index_copy_(1, dynamic_idx, proj_dyn)
+                    def _manual_reuse_attention():
+                        q_scaled = q_dyn * self.scale
+                        attn = q_scaled @ k_ctx.transpose(-2, -1)
+                        attn = attn.softmax(dim=-1)
+                        attn = self.attn_drop(attn)
+                        return attn @ v_ctx
+
+                    out_dyn = _vla_detail_time(
+                        profile_parent, "attn_reuse_attention_ms", _manual_reuse_attention
+                    )
+
+                def _reuse_project_scatter():
+                    attn_dyn_local = out_dyn.transpose(1, 2).reshape(B, dynamic_idx.numel(), C)
+                    # Prepare/reuse buffers
+                    if cache.attn_out is None or cache.attn_out.shape[1] != N:
+                        cache.attn_out = x.new_zeros(B, N, C)
+                    if cache.attn_proj is None or cache.attn_proj.shape[1] != N:
+                        cache.attn_proj = x.new_zeros(B, N, C)
+                    attn_full_local = cache.attn_out
+                    proj_full_local = cache.attn_proj
+                    # Static slices already in cache; dynamic slices freshly computed
+                    attn_full_local.index_copy_(1, dynamic_idx, attn_dyn_local)
+                    proj_dyn = self.proj(attn_dyn_local)
+                    proj_dyn = self.proj_drop(proj_dyn)
+                    proj_full_local.index_copy_(1, dynamic_idx, proj_dyn)
+                    return attn_full_local, proj_full_local
+
+                attn_full, proj_full = _vla_detail_time(
+                    profile_parent, "attn_reuse_project_scatter_ms", _reuse_project_scatter
+                )
 
                 cache.attn_out = attn_full.detach()
                 cache.attn_proj = proj_full.detach()
@@ -234,6 +396,7 @@ class Attention(nn.Module):
                 out = proj_full
             else:
                 # all static: reuse cache outputs
+                _vla_detail_add(profile_parent, "attn_reuse_all_static_calls", 1)
                 attn_out = cache.attn_out
                 out = cache.attn_proj if cache.attn_proj is not None else self.proj_drop(self.proj(attn_out))
 
@@ -241,29 +404,46 @@ class Attention(nn.Module):
             if _debug_vit:
                 num_static = static_idx.numel()
                 num_dynamic = dynamic_idx.numel()
-                print(f"[ViT-Attn] block {cache_index} reuse (full KV): static={num_static} dynamic={num_dynamic}")
+                num_pruned = bookkeeping_pruned_idx.numel()
+                print(f"[ViT-Attn] block {cache_index} reuse: static={num_static} dynamic={num_dynamic} pruned_kv={num_pruned} visible_kv={visible_kv_idx.numel()}")
 
         else:
             # Full attention path
-            qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+            _vla_detail_add(profile_parent, "attn_full_calls", 1)
+            _vla_detail_add(profile_parent, "attn_full_tokens", N)
+            qkv = _vla_detail_time(
+                profile_parent,
+                "attn_full_qkv_ms",
+                lambda: self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4),
+            )
             q, k, v = qkv.unbind(0)
             q, k = self.q_norm(q), self.k_norm(k)
 
             if self.fused_attn:
-                out = F.scaled_dot_product_attention(
-                    q, k, v,
-                    dropout_p=self.attn_drop.p if self.training else 0.,
+                out = _vla_detail_time(
+                    profile_parent,
+                    "attn_full_attention_ms",
+                    lambda: F.scaled_dot_product_attention(
+                        q, k, v,
+                        dropout_p=self.attn_drop.p if self.training else 0.,
+                    ),
                 )
             else:
-                q = q * self.scale
-                attn = q @ k.transpose(-2, -1)
-                attn = attn.softmax(dim=-1)
-                attn = self.attn_drop(attn)
-                out = attn @ v
+                def _manual_full_attention():
+                    q_scaled = q * self.scale
+                    attn = q_scaled @ k.transpose(-2, -1)
+                    attn = attn.softmax(dim=-1)
+                    attn = self.attn_drop(attn)
+                    return attn @ v
+
+                out = _vla_detail_time(profile_parent, "attn_full_attention_ms", _manual_full_attention)
 
             attn_out = out.transpose(1, 2).reshape(B, N, C)
-            out = self.proj(attn_out)
-            out = self.proj_drop(out)
+            out = _vla_detail_time(
+                profile_parent,
+                "attn_full_project_ms",
+                lambda: self.proj_drop(self.proj(attn_out)),
+            )
             if cache_enabled:
                 if cache is None:
                     cache = VitBlockCache(
@@ -274,8 +454,8 @@ class Attention(nn.Module):
                         device=x.device,
                         dtype=x.dtype,
                     )
-                cache.k = k
-                cache.v = v
+                cache.k = k.detach()
+                cache.v = v.detach()
                 cache.attn_out = attn_out.detach()
                 cache.attn_proj = out.detach()
                 cache_container[cache_index] = cache
@@ -346,6 +526,7 @@ class Block(nn.Module):
 
     def forward(self, x):
         reuse_mask = None
+        delete_mask = None
         cache_enabled = False
         timing = False
         parent_ref = getattr(self, "_vla_parent_ref", None)
@@ -363,8 +544,14 @@ class Block(nn.Module):
 
         if parent is not None and getattr(parent, "_vla_cache_enabled", False):
             reuse_mask = getattr(parent, "_vla_reuse_mask", None)
+            delete_mask = getattr(parent, "_vla_delete_mask", None)
             cache_container = getattr(parent, "_vla_cache_state", None)
             cache_index = getattr(self, "vla_index", None)
+            delete_mask_valid = (
+                delete_mask is not None
+                and delete_mask.numel() == x.shape[1]
+                and delete_mask.dtype == torch.bool
+            )
             if (
                 reuse_mask is not None
                 and cache_container is not None
@@ -377,15 +564,20 @@ class Block(nn.Module):
                 cache = cache_container[cache_index]
                 if _debug_vit:
                     num_static = reuse_mask.sum().item()
-                    print(f"[ViT-Block] enabling reuse block {cache_index}: seq_len={x.shape[1]} static={num_static}")
+                    num_pruned = delete_mask.sum().item() if delete_mask_valid else 0
+                    print(f"[ViT-Block] enabling reuse block {cache_index}: seq_len={x.shape[1]} static={num_static} pruned={num_pruned}")
                 ctx = VitCacheContext(
                     reuse_mask=reuse_mask,
+                    delete_mask=delete_mask if delete_mask_valid else None,
                     cache=cache,
                     cache_container=cache_container,
                     cache_index=cache_index,
                     cache_enabled=cache_enabled,
                     static_reuse_enabled=getattr(parent, "_vla_static_reuse_enabled", True),
+                    delete_enabled=getattr(parent, "_vla_delete_enabled", True),
+                    overhead_benchmark=getattr(parent, "_vla_overhead_benchmark", False),
                     force_keyframe=force_keyframe,
+                    parent=parent,
                 )
                 self.attn.set_cache_context(ctx)
             else:
@@ -429,7 +621,12 @@ class Block(nn.Module):
             and reuse_mask.numel() == x.shape[1]
         ):
             dynamic_idx = (~reuse_mask).nonzero(as_tuple=True)[0]
+            static_idx = reuse_mask.nonzero(as_tuple=True)[0]
+            _vla_detail_add(parent, "mlp_reuse_calls", 1)
+            _vla_detail_add(parent, "mlp_reuse_dynamic_tokens", dynamic_idx.numel())
+            _vla_detail_add(parent, "mlp_reuse_static_tokens", static_idx.numel())
             if dynamic_idx.numel() == 0:
+                _vla_detail_add(parent, "mlp_reuse_all_static_calls", 1)
                 if timing:
                     try:
                         mlp_end.record()
@@ -450,17 +647,23 @@ class Block(nn.Module):
 
             attn_proj_dyn = attn_proj[:, dynamic_idx, :]
             x_attn_dyn = x[:, dynamic_idx, :] + self.drop_path1(self.ls1(attn_proj_dyn))
-            x_dyn_norm = self.norm2(x_attn_dyn)
-            mlp_dyn = self.mlp(x_dyn_norm)
-            mlp_full.index_copy_(1, dynamic_idx, mlp_dyn)
-            dyn_res = x_attn_dyn + self.drop_path2(self.ls2(mlp_dyn))
-            x_out.index_copy_(1, dynamic_idx, dyn_res)
+            def _reuse_mlp_compute():
+                x_dyn_norm_local = self.norm2(x_attn_dyn)
+                mlp_dyn_local = self.mlp(x_dyn_norm_local)
+                dyn_res_local = x_attn_dyn + self.drop_path2(self.ls2(mlp_dyn_local))
+                return mlp_dyn_local, dyn_res_local
+
+            mlp_dyn, dyn_res = _vla_detail_time(parent, "mlp_reuse_compute_ms", _reuse_mlp_compute)
+
+            def _reuse_mlp_scatter():
+                mlp_full.index_copy_(1, dynamic_idx, mlp_dyn)
+                x_out.index_copy_(1, dynamic_idx, dyn_res)
+                if static_idx.numel() > 0:
+                    x_out[:, static_idx, :] = cache.block_out[:, static_idx, :].to(x.dtype)
+
+            _vla_detail_time(parent, "mlp_reuse_scatter_ms", _reuse_mlp_scatter)
 
             # Static tokens: directly reuse cached block_out / mlp_out
-            static_idx = reuse_mask.nonzero(as_tuple=True)[0]
-            if static_idx.numel() > 0:
-                x_out[:, static_idx, :] = cache.block_out[:, static_idx, :].to(x.dtype)
-
             cache.mlp_out = mlp_full
             cache.block_out = x_out
             if _debug_vit:
@@ -475,9 +678,20 @@ class Block(nn.Module):
                     pass
             return x_out
 
-        if cache_enabled and not force_keyframe and cache is not None and cache.mlp_out is not None and reuse_mask is not None and reuse_mask.numel() == x.shape[1]:
+        if (
+            cache_enabled
+            and static_reuse_enabled
+            and not force_keyframe
+            and cache is not None
+            and cache.mlp_out is not None
+            and reuse_mask is not None
+            and reuse_mask.numel() == x.shape[1]
+        ):
             dynamic_idx = (~reuse_mask).nonzero(as_tuple=True)[0]
             static_idx = reuse_mask.nonzero(as_tuple=True)[0]
+            _vla_detail_add(parent, "mlp_reuse_fallback_calls", 1)
+            _vla_detail_add(parent, "mlp_reuse_dynamic_tokens", dynamic_idx.numel())
+            _vla_detail_add(parent, "mlp_reuse_static_tokens", static_idx.numel())
 
             mlp_full = cache.mlp_out.to(x.dtype)
             x_out = x_attn.clone()
@@ -489,11 +703,18 @@ class Block(nn.Module):
 
             # Dynamic: compute fresh MLP on dynamic slice
             if dynamic_idx.numel() > 0:
-                x_dyn_norm = self.norm2(x_attn[:, dynamic_idx, :])
-                mlp_dyn = self.mlp(x_dyn_norm)
-                mlp_full.index_copy_(1, dynamic_idx, mlp_dyn)
-                dyn_res = x_attn[:, dynamic_idx, :] + self.drop_path2(self.ls2(mlp_dyn))
-                x_out[:, dynamic_idx, :] = dyn_res
+                def _fallback_mlp_compute():
+                    x_dyn_norm_local = self.norm2(x_attn[:, dynamic_idx, :])
+                    mlp_dyn_local = self.mlp(x_dyn_norm_local)
+                    dyn_res_local = x_attn[:, dynamic_idx, :] + self.drop_path2(self.ls2(mlp_dyn_local))
+                    return mlp_dyn_local, dyn_res_local
+
+                mlp_dyn, dyn_res = _vla_detail_time(parent, "mlp_reuse_compute_ms", _fallback_mlp_compute)
+                def _fallback_mlp_scatter():
+                    mlp_full.index_copy_(1, dynamic_idx, mlp_dyn)
+                    x_out[:, dynamic_idx, :] = dyn_res
+
+                _vla_detail_time(parent, "mlp_reuse_scatter_ms", _fallback_mlp_scatter)
                 if _debug_vit:
                     print(f"[ViT-MLP] block {cache_index} reuse: static={static_idx.numel()} dynamic={dynamic_idx.numel()}")
 
@@ -509,9 +730,15 @@ class Block(nn.Module):
                     pass
             return x_out
         else:
-            x_norm2 = self.norm2(x_attn)
-            mlp_out = self.mlp(x_norm2)
-            x_out = x_attn + self.drop_path2(self.ls2(mlp_out))
+            _vla_detail_add(parent, "mlp_full_calls", 1)
+            _vla_detail_add(parent, "mlp_full_tokens", x.shape[1])
+            def _full_mlp_compute():
+                x_norm2_local = self.norm2(x_attn)
+                mlp_out_local = self.mlp(x_norm2_local)
+                x_out_local = x_attn + self.drop_path2(self.ls2(mlp_out_local))
+                return mlp_out_local, x_out_local
+
+            mlp_out, x_out = _vla_detail_time(parent, "mlp_full_compute_ms", _full_mlp_compute)
             if cache_enabled:
                 if cache is None:
                     cache = VitBlockCache(
@@ -534,6 +761,65 @@ class Block(nn.Module):
                 except Exception:
                     pass
             return x_out
+
+    def forward_compact_dynamic(
+            self,
+            x_dyn: torch.Tensor,
+            dynamic_idx: torch.Tensor,
+            visible_kv_idx: torch.Tensor,
+            pruned_idx: torch.Tensor,
+            seq_len: int,
+    ) -> torch.Tensor:
+        """Forward one block while keeping only dynamic tokens in the block-to-block stream."""
+        parent_ref = getattr(self, "_vla_parent_ref", None)
+        parent = parent_ref() if parent_ref is not None else None
+        cache_container = getattr(parent, "_vla_cache_state", None) if parent is not None else None
+        cache_index = getattr(self, "vla_index", None)
+        if cache_container is None or cache_index is None or cache_index >= len(cache_container):
+            raise RuntimeError("ViT compact path requires an initialized per-block cache")
+        cache = cache_container[cache_index]
+        if cache is None or cache.block_out is None or cache.mlp_out is None or cache.attn_out is None:
+            raise RuntimeError("ViT compact path requires warm caches from a prior full frame")
+
+        _vla_detail_add(parent, "attn_reuse_calls", 1)
+        _vla_detail_add(parent, "attn_reuse_dynamic_tokens", dynamic_idx.numel())
+        _vla_detail_add(parent, "attn_reuse_static_tokens", seq_len - dynamic_idx.numel())
+        _vla_detail_add(parent, "attn_pruned_kv_tokens", pruned_idx.numel())
+        _vla_detail_add(parent, "mlp_reuse_calls", 1)
+        _vla_detail_add(parent, "mlp_reuse_dynamic_tokens", dynamic_idx.numel())
+        _vla_detail_add(parent, "mlp_reuse_static_tokens", seq_len - dynamic_idx.numel())
+
+        x_norm_dyn = self.norm1(x_dyn)
+        attn_proj_dyn, _ = self.attn.forward_reuse_compact(
+            x_norm_dyn,
+            dynamic_idx,
+            seq_len,
+            cache,
+            visible_kv_idx,
+            pruned_idx,
+            parent,
+        )
+        x_attn_dyn = x_dyn + self.drop_path1(self.ls1(attn_proj_dyn))
+
+        def _compact_mlp_compute():
+            x_dyn_norm_local = self.norm2(x_attn_dyn)
+            mlp_dyn_local = self.mlp(x_dyn_norm_local)
+            dyn_res_local = x_attn_dyn + self.drop_path2(self.ls2(mlp_dyn_local))
+            return mlp_dyn_local, dyn_res_local
+
+        mlp_dyn, dyn_res = _vla_detail_time(parent, "mlp_reuse_compute_ms", _compact_mlp_compute)
+
+        def _compact_mlp_update():
+            if cache.mlp_out is None or cache.mlp_out.shape != (x_dyn.shape[0], seq_len, x_dyn.shape[2]):
+                cache.mlp_out = x_dyn.new_zeros(x_dyn.shape[0], seq_len, x_dyn.shape[2])
+            if cache.block_out is None or cache.block_out.shape != (x_dyn.shape[0], seq_len, x_dyn.shape[2]):
+                cache.block_out = x_dyn.new_zeros(x_dyn.shape[0], seq_len, x_dyn.shape[2])
+            cache.mlp_out.index_copy_(1, dynamic_idx, mlp_dyn)
+            cache.block_out.index_copy_(1, dynamic_idx, dyn_res)
+
+        _vla_detail_time(parent, "mlp_reuse_scatter_ms", _compact_mlp_update)
+        cache_container[cache_index] = cache
+        return dyn_res
 
 
 class ResPostBlock(nn.Module):
@@ -908,8 +1194,12 @@ class VisionTransformer(nn.Module):
         # VLA cache (ViT-side) state
         self._vla_cache_state: Optional[List[Optional[VitBlockCache]]] = [None] * depth
         self._vla_reuse_mask: Optional[torch.Tensor] = None
+        self._vla_delete_mask: Optional[torch.Tensor] = None
+        self._vla_delete_enabled = True
+        self._vla_overhead_benchmark = False
         self._vla_cache_enabled = False
         self._vla_static_reuse_enabled = True
+        self._vla_compact_dynamic_enabled = os.environ.get("VLA_VIT_COMPACT_DYNAMIC", "1") == "1"
 
         self._vla_time_enabled = _time_vit
         self._vla_total_cuda_time = 0.0  # per-block core timing (attn + mlp)
@@ -923,6 +1213,13 @@ class VisionTransformer(nn.Module):
         # Print every call by default; override via env if needed
         self._vla_profile_interval = int(os.environ.get("VLA_VIT_PROFILE_INTERVAL", 1))
         self._vla_profile_print = os.environ.get("VLA_VIT_PROFILE_PRINT", "1") == "1"
+        self._vla_detail_profile_enabled = _detail_time_vit
+        self._vla_detail_profile_interval = int(os.environ.get("VLA_VIT_DETAIL_INTERVAL", "10"))
+        self._vla_detail_profile_print = os.environ.get("VLA_VIT_DETAIL_PRINT", "1") == "1"
+        self._vla_detail_profile_warmup = int(os.environ.get("VLA_VIT_DETAIL_WARMUP", "0"))
+        self._vla_detail_step_stats = {}
+        self._vla_detail_total_stats = {}
+        self._vla_detail_num_forward = 0
         # Keyframe refresh (optional, overridable via setter)
         self._vla_keyframe_interval = int(os.environ.get("VLA_VIT_KEYFRAME_INTERVAL", 0))
         self._vla_frame_idx = 0
@@ -956,6 +1253,60 @@ class VisionTransformer(nn.Module):
         return {'pos_embed', 'cls_token', 'dist_token'}
 
     @torch.jit.ignore
+    def _vla_detail_reset_step(self):
+        if self._vla_detail_profile_enabled:
+            self._vla_detail_step_stats = {}
+
+    @torch.jit.ignore
+    def _vla_detail_finish_step(self):
+        if not self._vla_detail_profile_enabled:
+            return
+        self._vla_detail_num_forward += 1
+        current = dict(self._vla_detail_step_stats)
+        for key, value in current.items():
+            self._vla_detail_total_stats[key] = self._vla_detail_total_stats.get(key, 0.0) + float(value)
+        if self._vla_detail_num_forward <= self._vla_detail_profile_warmup:
+            return
+        eff_steps = max(1, self._vla_detail_num_forward - self._vla_detail_profile_warmup)
+        if not self._vla_detail_profile_print:
+            return
+        interval = self._vla_detail_profile_interval
+        if interval > 0 and eff_steps % interval != 0:
+            return
+        keys = [
+            "attn_full_qkv_ms",
+            "attn_full_attention_ms",
+            "attn_full_project_ms",
+            "attn_reuse_qkv_ms",
+            "attn_reuse_cache_update_ms",
+            "attn_reuse_attention_ms",
+            "attn_reuse_project_scatter_ms",
+            "mlp_full_compute_ms",
+            "mlp_reuse_compute_ms",
+            "mlp_reuse_scatter_ms",
+            "attn_full_calls",
+            "attn_reuse_calls",
+            "attn_reuse_dynamic_tokens",
+            "attn_reuse_static_tokens",
+            "attn_pruned_kv_tokens",
+            "mlp_full_calls",
+            "mlp_reuse_calls",
+            "mlp_reuse_dynamic_tokens",
+            "mlp_reuse_static_tokens",
+            "compact_dynamic_calls",
+            "compact_dynamic_tokens",
+            "compact_static_tokens",
+        ]
+        current_msg = []
+        avg_msg = []
+        for key in keys:
+            if key in current:
+                current_msg.append(f"{key}={current[key]:.3f}")
+            if key in self._vla_detail_total_stats:
+                avg_msg.append(f"{key}={self._vla_detail_total_stats[key] / eff_steps:.3f}")
+        print(f"[ViT Detail] Current {' '.join(current_msg)} | Average {' '.join(avg_msg)}")
+
+    @torch.jit.ignore
     def group_matcher(self, coarse=False):
         return dict(
             stem=r'^cls_token|pos_embed|patch_embed',  # stem and embed
@@ -974,12 +1325,18 @@ class VisionTransformer(nn.Module):
             enable_reuse: bool = True,
             enable_static_reuse: bool = True,
             keyframe_interval: Optional[int] = None,
+            delete_mask: Optional[torch.Tensor] = None,
+            enable_delete: bool = True,
+            overhead_benchmark: bool = False,
     ):
-        """Set ViT-side cache and patch reuse mask for VLA-Cache inference."""
+        """Set ViT-side cache and tri-state patch masks for VLA-Cache inference."""
         self._vla_cache_state = cache_state if cache_state is not None else [None] * len(self.blocks)
         self._vla_reuse_mask = reuse_mask
+        self._vla_delete_mask = delete_mask
         self._vla_cache_enabled = enable_reuse and reuse_mask is not None
         self._vla_static_reuse_enabled = enable_static_reuse
+        self._vla_delete_enabled = enable_delete
+        self._vla_overhead_benchmark = overhead_benchmark
         if keyframe_interval is not None:
             self._vla_keyframe_interval = int(keyframe_interval)
 
@@ -991,6 +1348,9 @@ class VisionTransformer(nn.Module):
     def reset_vla_cache(self):
         self._vla_cache_state = [None] * len(self.blocks)
         self._vla_reuse_mask = None
+        self._vla_delete_mask = None
+        self._vla_delete_enabled = True
+        self._vla_overhead_benchmark = False
         self._vla_cache_enabled = False
         self._vla_frame_idx = 0
         self._vla_force_keyframe = False
@@ -1054,29 +1414,99 @@ class VisionTransformer(nn.Module):
 
         # Estimate static tokens (if provided) to approximate reduced compute
         reuse_mask = getattr(self, "_vla_reuse_mask", None)
-        cache_active = getattr(self, "_vla_cache_enabled", False)
+        delete_mask = getattr(self, "_vla_delete_mask", None)
+        cache_path_active = (
+            getattr(self, "_vla_cache_enabled", False)
+            and not getattr(self, "_vla_force_keyframe", False)
+        )
+        static_reuse_enabled = getattr(self, "_vla_static_reuse_enabled", True)
 
         # forward pass
         x = self.patch_embed(x)
         x = self._pos_embed(x)
         x = self.patch_drop(x)
         x = self.norm_pre(x)
+        seq_len = x.shape[1]
+        compact_dynamic = False
+        dynamic_idx = None
+        visible_kv_idx = None
+        pruned_idx = None
+        if (
+            getattr(self, "_vla_compact_dynamic_enabled", False)
+            and cache_path_active
+            and reuse_mask is not None
+            and reuse_mask.numel() == seq_len
+            and reuse_mask.dtype == torch.bool
+        ):
+            effective_reuse_mask = reuse_mask if static_reuse_enabled else torch.zeros_like(reuse_mask, dtype=torch.bool)
+            effective_delete = (
+                delete_mask & effective_reuse_mask
+                if (
+                    static_reuse_enabled
+                    and getattr(self, "_vla_delete_enabled", True)
+                    and delete_mask is not None
+                    and delete_mask.numel() == seq_len
+                    and delete_mask.dtype == torch.bool
+                )
+                else torch.zeros_like(effective_reuse_mask, dtype=torch.bool)
+            )
+            dynamic_idx = (~effective_reuse_mask).nonzero(as_tuple=True)[0]
+            visible_kv_idx = (~effective_delete).nonzero(as_tuple=True)[0]
+            pruned_idx = effective_delete.nonzero(as_tuple=True)[0]
+            cache_state = getattr(self, "_vla_cache_state", None)
+            compact_dynamic = (
+                dynamic_idx.numel() > 0
+                and cache_state is not None
+                and len(cache_state) >= len(self.blocks)
+                and all(hasattr(self.blocks[i], "forward_compact_dynamic") for i in range(len(self.blocks)))
+                and all(
+                    cache_state[i] is not None
+                    and cache_state[i].attn_out is not None
+                    and cache_state[i].attn_proj is not None
+                    and cache_state[i].mlp_out is not None
+                    and cache_state[i].block_out is not None
+                    for i in range(len(self.blocks))
+                )
+            )
+            if compact_dynamic:
+                _vla_detail_add(self, "compact_dynamic_calls", 1)
+                _vla_detail_add(self, "compact_dynamic_tokens", dynamic_idx.numel())
+                _vla_detail_add(self, "compact_static_tokens", seq_len - dynamic_idx.numel())
+
+        x_dyn = x.index_select(1, dynamic_idx) if compact_dynamic else None
         for i, blk in enumerate(self.blocks):
-            x = blk(x)
-            if i in take_indices:
-                outputs.append(x)
+            if compact_dynamic:
+                x_dyn = blk.forward_compact_dynamic(x_dyn, dynamic_idx, visible_kv_idx, pruned_idx, seq_len)
+                if i in take_indices:
+                    cache_i = self._vla_cache_state[i]
+                    outputs.append(cache_i.block_out.to(x_dyn.dtype))
+            else:
+                x = blk(x)
+                if i in take_indices:
+                    outputs.append(x)
             # FLOPs estimation (attention + MLP) for monitoring
             try:
-                n_tok = x.shape[1]
+                n_tok = seq_len
                 d = x.shape[2]
                 m = getattr(blk.mlp, "fc1").out_features if hasattr(blk.mlp, "fc1") else d * 4
-                if cache_active and reuse_mask is not None and reuse_mask.numel() == n_tok:
-                    static_tokens = reuse_mask.sum().item()
+                if cache_path_active and reuse_mask is not None and reuse_mask.numel() == n_tok:
+                    effective_reuse_mask = reuse_mask if static_reuse_enabled else torch.zeros_like(reuse_mask, dtype=torch.bool)
+                    static_tokens = effective_reuse_mask.sum().item()
+                    pruned_tokens = (
+                        (delete_mask & effective_reuse_mask).sum().item()
+                        if (
+                            static_reuse_enabled
+                            and delete_mask is not None
+                            and delete_mask.numel() == n_tok
+                        )
+                        else 0
+                    )
                     dyn = max(n_tok - static_tokens, 0)
-                    # Projections: Q/K/V for dynamic, output for all
-                    proj_flops = (3 * dyn + n_tok) * (d ** 2)
-                    # Attention matmul: dynamic queries over full KV
-                    attn_flops = 2 * dyn * n_tok * d
+                    visible_kv = max(n_tok - pruned_tokens, 0)
+                    # Projections: Q/K/V and output projection are computed only for dynamic tokens.
+                    proj_flops = 4 * dyn * (d ** 2)
+                    # Attention matmul: dynamic queries over visible KV
+                    attn_flops = 2 * dyn * visible_kv * d
                     # MLP only for dynamic tokens
                     mlp_flops = 3 * dyn * d * m
                     flops_block = proj_flops + attn_flops + mlp_flops
@@ -1106,6 +1536,7 @@ class VisionTransformer(nn.Module):
             self._vla_core_step_cuda = 0.0
             self._vla_attn_step_cuda = 0.0
             self._vla_mlp_step_cuda = 0.0
+        self._vla_detail_reset_step()
         # Keyframe handling
         if self._vla_keyframe_interval > 0:
             self._vla_force_keyframe = (self._vla_frame_idx % self._vla_keyframe_interval == 0)
@@ -1148,6 +1579,7 @@ class VisionTransformer(nn.Module):
                 if self._vla_profile_print and (self._vla_profile_interval <= 0 or (eff_steps % self._vla_profile_interval == 0)):
                     print(f"[ViT Profile] Current CUDA latency: {self._vla_core_step_cuda:.6f} ms (attn {self._vla_attn_step_cuda:.6f} ms, mlp {self._vla_mlp_step_cuda:.6f} ms) | Average CUDA latency: {avg_ms:.6f} ms (attn {avg_attn:.6f} ms, mlp {avg_mlp:.6f} ms), Average TFLOPs: {avg_tflops:.6f}")
 
+        self._vla_detail_finish_step()
         self._vla_frame_idx += 1
         return result
 
@@ -1157,6 +1589,7 @@ class VisionTransformer(nn.Module):
             self._vla_core_step_cuda = 0.0
             self._vla_attn_step_cuda = 0.0
             self._vla_mlp_step_cuda = 0.0
+        self._vla_detail_reset_step()
         # Keyframe handling
         if self._vla_keyframe_interval > 0:
             self._vla_force_keyframe = (self._vla_frame_idx % self._vla_keyframe_interval == 0)
@@ -1184,6 +1617,7 @@ class VisionTransformer(nn.Module):
                 if self._vla_profile_print and (self._vla_profile_interval <= 0 or (eff_steps % self._vla_profile_interval == 0)):
                     print(f"[ViT Profile] Current CUDA latency: {self._vla_core_step_cuda:.6f} ms | Average CUDA latency: {avg_ms:.6f} ms, Average TFLOPs: {avg_tflops:.6f}")
 
+        self._vla_detail_finish_step()
         self._vla_frame_idx += 1
         return x
 

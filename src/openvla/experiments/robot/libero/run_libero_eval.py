@@ -71,6 +71,9 @@ class GenerateConfig:
     vit_cache_standalone: bool = False
     # Benchmark mode always on: run ViT cache pipeline even when reuse is disabled
     vit_cache_benchmark: bool = True
+    # Run cache/mask bookkeeping even when acceleration switches are disabled
+    cache_overhead_benchmark: bool = True
+    llm_cache_benchmark: bool = True
     # Keyframe interval for ViT cache (0 means disabled)
     vit_cache_keyframe_interval: int = 0
     # Patch similarity metric for static detection: cosine | gray_diff | rgb_diff
@@ -86,6 +89,9 @@ class GenerateConfig:
     vit_cache_attention_top_k: int = 120
     # Static token top-k for temporal selection
     vit_cache_static_top_k: int = 130
+    # ViT-side visual token pruning; pruned tokens skip recompute and are hidden from ViT attention K/V.
+    vit_delete_enable: bool = False
+    vit_delete_ratio: float = 0.0
     # Optional: LLM-side mask parameters (fallback to vit_cache_* when None)
     llm_cache_patch_metric: Optional[str] = None
     llm_cache_patch_diff_threshold: Optional[float] = None
@@ -122,6 +128,7 @@ class GenerateConfig:
     #################################################################################################################
     run_id_note: Optional[str] = None                # Extra note to add in run ID for logging
     local_log_dir: str = "./experiments/logs"        # Local directory for eval logs
+    save_rollout_videos: bool = True                 # Whether to save per-episode rollout MP4s
 
     use_wandb: bool = False                          # Whether to also log results in Weights & Biases
     wandb_project: str = "YOUR_WANDB_PROJECT"        # Name of W&B project to log to (use default!)
@@ -232,6 +239,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
             replay_images_heatmap = []
             prev_img = None
             last_caches = None
+            latency_totals = {}
+            latency_steps = 0
             
             
             if cfg.task_suite_name == "libero_spatial":
@@ -280,15 +289,21 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
 
                     # Query model to get action
-                    action, last_caches, result_image = get_action(
+                    action, last_caches, result_image, latency_metrics = get_action(
                         cfg,
                         model,
                         observation,
                         task_description,
                         processor=processor,
                         last_caches=last_caches,
+                        return_metrics=True,
                     )
-                    replay_images_heatmap.append(result_image)
+                    latency_steps += 1
+                    for key, value in latency_metrics.items():
+                        if key.endswith("_ms"):
+                            latency_totals[key] = latency_totals.get(key, 0.0) + float(value)
+                    if cfg.save_rollout_videos:
+                        replay_images_heatmap.append(result_image)
                     # imageio.imwrite(f"rollouts/live_image.png", result_image)
 
                     # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
@@ -315,12 +330,11 @@ def eval_libero(cfg: GenerateConfig) -> None:
             task_episodes += 1
             total_episodes += 1
 
-            # Save a replay video of the episode
-            save_rollout_video(
-                replay_images_heatmap, total_episodes, success=done, task_description=task_description, log_file=log_file
-            )
+            if cfg.save_rollout_videos:
+                save_rollout_video(
+                    replay_images_heatmap, total_episodes, success=done, task_description=task_description, log_file=log_file
+                )
 
-            # Save a replay video of the episode
             # Log current results
             print(f"Success: {done}")
             print(f"# episodes completed so far: {total_episodes}")
@@ -328,6 +342,16 @@ def eval_libero(cfg: GenerateConfig) -> None:
             log_file.write(f"Success: {done}\n")
             log_file.write(f"# episodes completed so far: {total_episodes}\n")
             log_file.write(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)\n")
+            if latency_steps > 0:
+                latency_avg = {key: value / latency_steps for key, value in latency_totals.items()}
+                latency_msg = (
+                    "[Latency Avg] wall_ms total={total_wall_ms:.3f} overhead={overhead_wall_ms:.3f} "
+                    "vit={vit_wall_ms:.3f} llm={llm_wall_ms:.3f} action_head={action_head_wall_ms:.3f} | "
+                    "cuda_ms total={total_cuda_ms:.3f} overhead={overhead_cuda_ms:.3f} "
+                    "vit={vit_cuda_ms:.3f} llm={llm_cuda_ms:.3f} action_head={action_head_cuda_ms:.3f}"
+                ).format(**latency_avg)
+                print(latency_msg)
+                log_file.write(latency_msg + "\n")
             log_file.flush()
 
         # Log final results

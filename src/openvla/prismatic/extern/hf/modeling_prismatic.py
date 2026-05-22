@@ -13,6 +13,7 @@ References [LLaVa, IDEFICS-2]:
 """
 
 import logging
+import time
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple, Union
@@ -255,6 +256,40 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         # HF Boilerplate =>> initializes weights via `_init_weights()` and sets gradient checkpointing
         self.post_init()
 
+    def _reset_latency_metrics(self) -> None:
+        self._vla_latency_metrics = {
+            "vit_wall_ms": 0.0,
+            "vit_cuda_ms": 0.0,
+            "llm_wall_ms": 0.0,
+            "llm_cuda_ms": 0.0,
+            "action_head_wall_ms": 0.0,
+            "action_head_cuda_ms": 0.0,
+        }
+
+    def _timed_segment(self, name: str, fn: Callable[[], Any]) -> Any:
+        metrics = getattr(self, "_vla_latency_metrics", None)
+        if metrics is None:
+            return fn()
+
+        use_cuda = torch.cuda.is_available()
+        start_event = torch.cuda.Event(enable_timing=True) if use_cuda else None
+        end_event = torch.cuda.Event(enable_timing=True) if use_cuda else None
+        if use_cuda:
+            torch.cuda.synchronize()
+            start_event.record()
+        wall_start = time.perf_counter()
+        result = fn()
+        if use_cuda:
+            end_event.record()
+            torch.cuda.synchronize()
+            cuda_ms = start_event.elapsed_time(end_event)
+        else:
+            cuda_ms = 0.0
+        wall_ms = (time.perf_counter() - wall_start) * 1000.0
+        metrics[f"{name}_wall_ms"] = metrics.get(f"{name}_wall_ms", 0.0) + wall_ms
+        metrics[f"{name}_cuda_ms"] = metrics.get(f"{name}_cuda_ms", 0.0) + cuda_ms
+        return result
+
     # === `PreTrainedModel` Boilerplate ===
     def get_input_embeddings(self) -> nn.Module:
         return self.language_model.get_input_embeddings()
@@ -328,17 +363,20 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             assert past_key_values is not None, "You must provide `past_key_values` during cached generation!"
             assert labels is None, "Unexpected key `labels` provided during cached generation!"
 
-            language_model_output = self.language_model(
-                input_ids=input_ids,
-                attention_mask=None,
-                position_ids=None,
-                past_key_values=past_key_values,
-                inputs_embeds=None,
-                labels=None,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
+            language_model_output = self._timed_segment(
+                "llm",
+                lambda: self.language_model(
+                    input_ids=input_ids,
+                    attention_mask=None,
+                    position_ids=None,
+                    past_key_values=past_key_values,
+                    inputs_embeds=None,
+                    labels=None,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict,
+                ),
             )
 
         # === Handle Unimodal Forward ===
@@ -346,28 +384,32 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             assert (input_ids is not None) and (inputs_embeds is None), "Missing `input_ids` in language-only forward!"
             assert past_key_values is None, "Unexpected key `past_key_values` provided during language-only forward!"
 
-            language_model_output = self.language_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=None,
-                past_key_values=None,
-                inputs_embeds=None,
-                labels=labels,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
+            language_model_output = self._timed_segment(
+                "llm",
+                lambda: self.language_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=None,
+                    past_key_values=None,
+                    inputs_embeds=None,
+                    labels=labels,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict,
+                ),
             )
 
         # === Handle Multimodal Forward ===
         elif (input_ids.shape[0] == pixel_values.shape[0]) or (inputs_embeds.shape[0] == pixel_values.shape[0]):
             # assert past_key_values is None, "Unexpected key `past_key_values` provided during language-only forward!"
 
-            # Visual Feature Extraction
-            patch_features = self.vision_backbone(pixel_values)
+            # Visual Feature Extraction + Projection Logic
+            def _run_vision_projector():
+                patch_features = self.vision_backbone(pixel_values)
+                return self.projector(patch_features)
 
-            # Projection Logic =>> Update Attention Mask
-            projected_patch_embeddings = self.projector(patch_features)
+            projected_patch_embeddings = self._timed_segment("vit", _run_vision_projector)
             projected_patch_attention_mask = None
             if attention_mask is not None:
                 projected_patch_attention_mask = torch.full(
@@ -402,17 +444,20 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                 multimodal_labels = torch.cat([labels[:, :1], projected_patch_labels, labels[:, 1:]], dim=1)
 
             # Dispatch to Language Model
-            language_model_output = self.language_model(
-                input_ids=None,
-                attention_mask=multimodal_attention_mask,
-                position_ids=None,
-                past_key_values=past_key_values,
-                inputs_embeds=multimodal_embeddings,
-                labels=multimodal_labels,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
+            language_model_output = self._timed_segment(
+                "llm",
+                lambda: self.language_model(
+                    input_ids=None,
+                    attention_mask=multimodal_attention_mask,
+                    position_ids=None,
+                    past_key_values=past_key_values,
+                    inputs_embeds=multimodal_embeddings,
+                    labels=multimodal_labels,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict,
+                ),
             )
 
         # === Otherwise =>> Assume Invalid! ===
@@ -509,6 +554,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         self, input_ids: Optional[torch.LongTensor] = None, unnorm_key: Optional[str] = None, **kwargs: str
     ) -> np.ndarray:
         """Thin wrapper around .generate() that decodes predicted actions and unnormalizes them."""
+        self._reset_latency_metrics()
+
         # If the special empty token ('') does not already appear after the colon (':') token in the prompt
         # (after "OUT:" or "ASSISTANT:"), insert it to match the inputs seen at training time
         if not torch.all(input_ids[:, -1] == 29871):
@@ -518,31 +565,33 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         # Run VLA inference
         results = self.generate(input_ids, max_new_tokens=self.get_action_dim(unnorm_key), **kwargs)
-        attentions = results.attentions
-        past_key_values = results.past_key_values
-        max_cache_length = past_key_values._seen_tokens - self.get_action_dim(unnorm_key) + 1
-        past_key_values.crop(max_length=max_cache_length)
-        
-        last_caches = {"past_key_values": past_key_values, "attentions": attentions[0]}
-        generated_ids = results.sequences
+        def _decode_actions():
+            attentions = results.attentions
+            past_key_values = results.past_key_values
+            max_cache_length = past_key_values._seen_tokens - self.get_action_dim(unnorm_key) + 1
+            past_key_values.crop(max_length=max_cache_length)
 
-        # Extract predicted action tokens and translate into (normalized) continuous actions
-        predicted_action_token_ids = generated_ids[0, -self.get_action_dim(unnorm_key) :].cpu().numpy()
-        discretized_actions = self.vocab_size - predicted_action_token_ids
-        discretized_actions = np.clip(discretized_actions - 1, a_min=0, a_max=self.bin_centers.shape[0] - 1)
-        normalized_actions = self.bin_centers[discretized_actions]
+            last_caches = {"past_key_values": past_key_values, "attentions": attentions[0]}
+            generated_ids = results.sequences
 
-        # Unnormalize actions
-        action_norm_stats = self.get_action_stats(unnorm_key)
-        mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["q01"], dtype=bool))
-        action_high, action_low = np.array(action_norm_stats["q99"]), np.array(action_norm_stats["q01"])
-        actions = np.where(
-            mask,
-            0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
-            normalized_actions,
-        )
+            # Extract predicted action tokens and translate into (normalized) continuous actions
+            predicted_action_token_ids = generated_ids[0, -self.get_action_dim(unnorm_key) :].cpu().numpy()
+            discretized_actions = self.vocab_size - predicted_action_token_ids
+            discretized_actions = np.clip(discretized_actions - 1, a_min=0, a_max=self.bin_centers.shape[0] - 1)
+            normalized_actions = self.bin_centers[discretized_actions]
 
-        return actions, last_caches
+            # Unnormalize actions
+            action_norm_stats = self.get_action_stats(unnorm_key)
+            mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["q01"], dtype=bool))
+            action_high, action_low = np.array(action_norm_stats["q99"]), np.array(action_norm_stats["q01"])
+            actions = np.where(
+                mask,
+                0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
+                normalized_actions,
+            )
+            return actions, last_caches
+
+        return self._timed_segment("action_head", _decode_actions)
 
     @staticmethod
     def _check_unnorm_key(norm_stats: Dict[str, Dict[str, Any]], unnorm_key: Optional[str]) -> str:
