@@ -128,6 +128,7 @@ class GenerateConfig:
     task_suite_name: str = "libero_spatial"          # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     num_steps_wait: int = 10                         # Number of steps to wait for objects to stabilize in sim
     num_trials_per_task: int = 50                    # Number of rollouts per task
+    num_warmup_trials_per_task: int = 0              # Unmeasured rollouts per task, useful for CUDA Graph capture
     num_tasks: Optional[int] = None                  # Number of tasks to evaluate from the suite. If None, all tasks are evaluated.
     task_start_id: int = 0                           # Starting task ID (0-indexed) for evaluation
 
@@ -211,8 +212,12 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
     print(f"Evaluating tasks {cfg.task_start_id} to {task_end_id-1} (total: {task_end_id - cfg.task_start_id} tasks)")
     print(f"Each task will be evaluated {cfg.num_trials_per_task} times")
+    if cfg.num_warmup_trials_per_task > 0:
+        print(f"Each task will run {cfg.num_warmup_trials_per_task} unmeasured warmup rollout(s) first")
     log_file.write(f"Evaluating tasks {cfg.task_start_id} to {task_end_id-1} (total: {task_end_id - cfg.task_start_id} tasks)\n")
     log_file.write(f"Each task will be evaluated {cfg.num_trials_per_task} times\n")
+    if cfg.num_warmup_trials_per_task > 0:
+        log_file.write(f"Each task will run {cfg.num_warmup_trials_per_task} unmeasured warmup rollout(s) first\n")
 
     # Get expected image dimensions
     resize_size = get_image_resize_size(cfg)
@@ -231,7 +236,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
         # Start episodes
         task_episodes, task_successes = 0, 0
-        for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
+        total_task_trials = cfg.num_warmup_trials_per_task + cfg.num_trials_per_task
+        for episode_idx in tqdm.tqdm(range(total_task_trials)):
+            is_warmup = episode_idx < cfg.num_warmup_trials_per_task
+            measured_episode_idx = episode_idx - cfg.num_warmup_trials_per_task
             print(f"\nTask: {task_description}")
             log_file.write(f"\nTask: {task_description}\n")
 
@@ -239,7 +247,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
             env.reset()
 
             # Set initial states
-            obs = env.set_init_state(initial_states[episode_idx])
+            state_idx = 0 if is_warmup else measured_episode_idx
+            obs = env.set_init_state(initial_states[state_idx])
 
             # Setup
             t = 0
@@ -262,8 +271,9 @@ def eval_libero(cfg: GenerateConfig) -> None:
             elif cfg.task_suite_name == "libero_90":
                 max_steps = 400  # longest training demo has 373 steps
 
-            print(f"Starting episode {task_episodes+1}...")
-            log_file.write(f"Starting episode {task_episodes+1}...\n")
+            episode_label = f"warmup episode {episode_idx + 1}" if is_warmup else f"episode {task_episodes + 1}"
+            print(f"Starting {episode_label}...")
+            log_file.write(f"Starting {episode_label}...\n")
             while t < max_steps + cfg.num_steps_wait:
                 try:
                     # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
@@ -325,8 +335,9 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     # Execute action in environment
                     obs, reward, done, info = env.step(action.tolist())
                     if done:
-                        task_successes += 1
-                        total_successes += 1
+                        if not is_warmup:
+                            task_successes += 1
+                            total_successes += 1
                         break
                     t += 1
 
@@ -334,6 +345,12 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     print(f"Caught exception: {e}")
                     log_file.write(f"Caught exception: {e}\n")
                     break
+
+            if is_warmup:
+                print(f"Warmup success: {done}")
+                log_file.write(f"Warmup success: {done}\n")
+                log_file.flush()
+                continue
 
             task_episodes += 1
             total_episodes += 1
