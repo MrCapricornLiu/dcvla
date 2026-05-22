@@ -16,6 +16,8 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 @dataclass
 class BucketSpec:
+    real_query_positions: torch.Tensor
+    real_kv_positions: torch.Tensor
     query_positions: torch.Tensor
     kv_positions: torch.Tensor
     cache_position: torch.Tensor
@@ -84,6 +86,24 @@ def _build_position_mask(
     return mask[None, None, :, :].contiguous()
 
 
+def _parse_buckets(value: Any, total_len: int, default: Tuple[int, ...]) -> List[int]:
+    if value is None or value == "":
+        buckets = list(default)
+    elif isinstance(value, str):
+        buckets = [int(item.strip()) for item in value.split(",") if item.strip()]
+    else:
+        buckets = [int(item) for item in value]
+    buckets.append(total_len)
+    return sorted({bucket for bucket in buckets if bucket > 0})
+
+
+def _ceil_bucket(real_len: int, buckets: List[int]) -> int:
+    for bucket in buckets:
+        if bucket >= real_len:
+            return bucket
+    return real_len
+
+
 def _copy_cache_(dst: BucketCache, src: BucketCache) -> None:
     for dst_key, src_key in zip(dst.key_cache, src.key_cache):
         dst_key.copy_(src_key)
@@ -98,12 +118,23 @@ def _make_empty_like_cache(cache: BucketCache) -> BucketCache:
     )
 
 
-def _clone_bucket_cache(full_cache: Any, kv_positions: torch.Tensor) -> BucketCache:
+def _clone_bucket_cache(full_cache: Any, real_kv_positions: torch.Tensor, kv_bucket_len: int) -> BucketCache:
     keys = []
     values = []
     for key_states, value_states in zip(full_cache.key_cache, full_cache.value_cache):
-        keys.append(key_states.index_select(2, kv_positions).clone())
-        values.append(value_states.index_select(2, kv_positions).clone())
+        key_bucket = key_states.index_select(2, real_kv_positions)
+        value_bucket = value_states.index_select(2, real_kv_positions)
+        pad_len = kv_bucket_len - int(real_kv_positions.numel())
+        if pad_len > 0:
+            key_pad = key_states.new_zeros(key_states.shape[:2] + (pad_len,) + key_states.shape[3:])
+            value_pad = value_states.new_zeros(value_states.shape[:2] + (pad_len,) + value_states.shape[3:])
+            key_bucket = torch.cat([key_bucket, key_pad], dim=2)
+            value_bucket = torch.cat([value_bucket, value_pad], dim=2)
+        else:
+            key_bucket = key_bucket.clone()
+            value_bucket = value_bucket.clone()
+        keys.append(key_bucket.contiguous())
+        values.append(value_bucket.contiguous())
     return BucketCache(keys, values)
 
 
@@ -113,6 +144,8 @@ def _build_bucket_spec(
     deleted_patches: Any,
     cache_effective: bool,
     prune_effective: bool,
+    q_buckets: Any,
+    kv_buckets: Any,
 ) -> BucketSpec:
     total_len = int(hidden_states.shape[1])
     device = hidden_states.device
@@ -135,17 +168,52 @@ def _build_bucket_spec(
     if pruned.numel() > 0:
         kv_visible[pruned] = False
 
-    query_positions = full_positions[query_visible]
-    kv_positions = full_positions[kv_visible]
-    original_to_compact = torch.full((total_len,), -1, dtype=torch.long, device=device)
-    original_to_compact[kv_positions] = torch.arange(kv_positions.numel(), dtype=torch.long, device=device)
+    real_query_positions = full_positions[query_visible]
+    real_kv_positions = full_positions[kv_visible]
+    real_query_len = int(real_query_positions.numel())
+    real_kv_len = int(real_kv_positions.numel())
 
-    cache_position = original_to_compact.index_select(0, query_positions).contiguous()
+    q_bucket_sizes = _parse_buckets(q_buckets, total_len, (64, 96, 128, 160, 192, 224, 256, 288, 320, 352))
+    kv_bucket_sizes = _parse_buckets(kv_buckets, total_len, (64, 96, 128, 160, 192, 224, 256, 288, 320, 352))
+    q_bucket_len = _ceil_bucket(real_query_len, q_bucket_sizes)
+    q_pad_len = q_bucket_len - real_query_len
+    kv_bucket_len = _ceil_bucket(real_kv_len + q_pad_len, kv_bucket_sizes)
+    kv_pad_len = kv_bucket_len - real_kv_len
+
+    if q_pad_len > 0:
+        query_pad = total_len + torch.arange(q_pad_len, dtype=torch.long, device=device)
+        query_positions = torch.cat([real_query_positions, query_pad], dim=0)
+    else:
+        query_positions = real_query_positions
+
+    if kv_pad_len > 0:
+        kv_pad = total_len + torch.arange(kv_pad_len, dtype=torch.long, device=device)
+        kv_positions = torch.cat([real_kv_positions, kv_pad], dim=0)
+    else:
+        kv_positions = real_kv_positions
+
+    original_to_compact = torch.full((total_len,), -1, dtype=torch.long, device=device)
+    original_to_compact[real_kv_positions] = torch.arange(real_kv_len, dtype=torch.long, device=device)
+
+    real_cache_position = original_to_compact.index_select(0, real_query_positions)
+    if q_pad_len > 0:
+        dummy_cache_position = real_kv_len + torch.arange(q_pad_len, dtype=torch.long, device=device)
+        cache_position = torch.cat([real_cache_position, dummy_cache_position], dim=0).contiguous()
+    else:
+        cache_position = real_cache_position.contiguous()
+
     position_ids = query_positions.unsqueeze(0).contiguous()
-    bucket_hidden = hidden_states.index_select(1, query_positions).contiguous()
+    real_hidden = hidden_states.index_select(1, real_query_positions)
+    if q_pad_len > 0:
+        hidden_pad = hidden_states.new_zeros(hidden_states.shape[0], q_pad_len, hidden_states.shape[2])
+        bucket_hidden = torch.cat([real_hidden, hidden_pad], dim=1).contiguous()
+    else:
+        bucket_hidden = real_hidden.contiguous()
     attention_mask = _build_position_mask(query_positions, kv_positions, hidden_states.dtype)
 
     return BucketSpec(
+        real_query_positions=real_query_positions,
+        real_kv_positions=real_kv_positions,
         query_positions=query_positions,
         kv_positions=kv_positions,
         cache_position=cache_position,
@@ -195,8 +263,9 @@ def _restore_full_cache_(
     spec: BucketSpec,
     total_len: int,
 ) -> None:
-    dst_idx = spec.query_positions
-    src_idx = spec.cache_position
+    real_query_len = int(spec.real_query_positions.numel())
+    dst_idx = spec.real_query_positions
+    src_idx = spec.cache_position[:real_query_len]
     for full_key, full_value, compact_key, compact_value in zip(
         full_cache.key_cache,
         full_cache.value_cache,
@@ -231,6 +300,8 @@ class BucketGraphRunner:
         self.static_cache_position = torch.empty_like(spec.cache_position)
         self.static_attention_mask = torch.empty_like(spec.attention_mask)
         self.static_spec = BucketSpec(
+            real_query_positions=spec.real_query_positions,
+            real_kv_positions=spec.real_kv_positions,
             query_positions=spec.query_positions,
             kv_positions=spec.kv_positions,
             cache_position=self.static_cache_position,
@@ -319,6 +390,8 @@ class BucketGraphRuntime:
         use_graph: bool,
         graph_warmup: int,
         max_graphs: int,
+        q_buckets: Any = None,
+        kv_buckets: Any = None,
     ) -> CausalLMOutputWithPast:
         total_len = int(hidden_states.shape[1])
         spec = _build_bucket_spec(
@@ -327,8 +400,10 @@ class BucketGraphRuntime:
             deleted_patches,
             cache_effective,
             prune_effective,
+            q_buckets,
+            kv_buckets,
         )
-        base_cache = _clone_bucket_cache(past_key_values, spec.kv_positions)
+        base_cache = _clone_bucket_cache(past_key_values, spec.real_kv_positions, int(spec.kv_positions.numel()))
 
         if use_graph and torch.cuda.is_available():
             key = self._runner_key(spec, output_attentions, output_hidden_states, language_model)
@@ -376,10 +451,17 @@ class BucketGraphRuntime:
         hidden, hidden_history, attentions = decoder_output
         _restore_full_cache_(past_key_values, compact_cache, spec, total_len)
 
+        real_query_len = int(spec.real_query_positions.numel())
+        real_kv_len = int(spec.real_kv_positions.numel())
+        hidden = hidden[:, :real_query_len]
+        if hidden_history is not None:
+            hidden_history = tuple(state[:, :real_query_len] for state in hidden_history)
         logits = language_model.lm_head(hidden).float()
         if attentions is None:
             attentions = ()
-        attentions = attentions + ((spec.query_positions, spec.kv_positions),)
+        else:
+            attentions = tuple(attn[:, :, :real_query_len, :real_kv_len] for attn in attentions)
+        attentions = attentions + ((spec.real_query_positions, spec.real_kv_positions),)
 
         return CausalLMOutputWithPast(
             loss=None,

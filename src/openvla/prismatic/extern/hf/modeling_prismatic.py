@@ -485,6 +485,8 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                         use_graph=bool(getattr(self.config, "llm_bucket_graph_capture", True)),
                         graph_warmup=int(getattr(self.config, "llm_bucket_graph_warmup", 2)),
                         max_graphs=int(getattr(self.config, "llm_bucket_graph_max_graphs", 32)),
+                        q_buckets=getattr(self.config, "llm_bucket_graph_q_buckets", None),
+                        kv_buckets=getattr(self.config, "llm_bucket_graph_kv_buckets", None),
                     )
                 except Exception as exc:
                     if not bool(getattr(self.config, "llm_bucket_graph_fallback", True)):

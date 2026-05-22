@@ -456,6 +456,12 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
     vla.config.llm_bucket_graph_warmup = int(getattr(cfg, "llm_bucket_graph_warmup", 2))
     vla.config.llm_bucket_graph_max_graphs = int(getattr(cfg, "llm_bucket_graph_max_graphs", 32))
     vla.config.llm_bucket_graph_fallback = bool(getattr(cfg, "llm_bucket_graph_fallback", True))
+    vla.config.llm_bucket_graph_q_buckets = getattr(
+        cfg, "llm_bucket_graph_q_buckets", "64,96,128,160,192,224,256,288,320,352"
+    )
+    vla.config.llm_bucket_graph_kv_buckets = getattr(
+        cfg, "llm_bucket_graph_kv_buckets", "64,96,128,160,192,224,256,288,320,352"
+    )
 
 
     # (If trained with image augmentations) Center crop image and then resize back up to original size.

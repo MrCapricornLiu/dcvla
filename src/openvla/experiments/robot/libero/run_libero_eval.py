@@ -109,6 +109,8 @@ class GenerateConfig:
     llm_bucket_graph_warmup: int = 2
     llm_bucket_graph_max_graphs: int = 32
     llm_bucket_graph_fallback: bool = True
+    llm_bucket_graph_q_buckets: str = "64,96,128,160,192,224,256,288,320,352"
+    llm_bucket_graph_kv_buckets: str = "64,96,128,160,192,224,256,288,320,352"
     
     #################################################################################################################
     # Model-specific parameters
