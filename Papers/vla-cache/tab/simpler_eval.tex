@@ -1,0 +1,51 @@
+
+\begin{table*}[t]
+\centering
+\caption{Comparison of VLA-Cache within the CogACT model in the SIMPLER environment.}
+\vskip -0.05in
+\small
+\resizebox{\linewidth}{!}{
+\begin{tabular}{llcccccccc}
+\toprule
+\multirow{2}{*}{SIMPLER} & \multirow{2}{*}{Method} 
+  & \multicolumn{5}{c}{Success Rate $\uparrow$} 
+  & \multirow{2}{*}{\shortstack{FLOPs\\(T)$\downarrow$}} 
+  & \multirow{2}{*}{\shortstack{Latency\\(ms) $\downarrow$}} 
+  & \multirow{2}{*}{\shortstack{Control Freq. \\ (Hz) $\uparrow$}} \\
+\cmidrule(lr){3-7}
+& & PickCan & MoveNear & Drawer & DrawerApple & Average & & & \\
+\midrule
+
+\multirow{2}{*}{Matching}  
+  & CogACT 
+    & 91.3\% & \textbf{85.0\%} & \textbf{71.8\%} & 50.9\% & \textbf{74.8\%} 
+    & 1.847 
+    & 54.29 
+    & 12.42 \\
+  & \quad + \textbf{VLA-Cache} 
+    & \textbf{92.0\%} & 83.3\% & 70.5\% & \textbf{51.6\%} & 74.4\% 
+    & \textbf{1.496} 
+    & \textbf{39.63} 
+    & \textbf{14.66} \\
+
+\midrule
+
+\multirow{2}{*}{Aggregation}  
+  & CogACT
+    & 89.6\% & 80.8\% & 28.3\% & \textbf{46.6\%} & 61.3\% 
+    & 1.807 
+    & 53.54 
+    & 12.36 \\
+  & \quad + \textbf{VLA-Cache}
+    & \textbf{91.7\%} & \textbf{79.3\%} & \textbf{32.5\%} & 45.8\% & \textbf{62.3\%} 
+    & \textbf{1.493} 
+    & \textbf{39.11} 
+    & \textbf{14.48} \\
+
+\bottomrule
+\end{tabular}
+}
+\vskip -0.1in
+\label{tab:simpler_eval}
+\end{table*}
+

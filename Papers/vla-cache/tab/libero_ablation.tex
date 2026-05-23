@@ -1,0 +1,34 @@
+\begin{wraptable}{r}{0.48\textwidth}
+\centering
+\vskip 0.05in
+\caption{Ablation on token pruning/reuse in LIBERO-Spatial using OpenVLA (256 vision tokens). Best values are in \textbf{bold}.}
+\small
+\resizebox{0.47\textwidth}{!}{ % 缩小内容以适配wraptable宽度
+\begin{tabular}{ccccc}
+\toprule
+\textbf{\#Tokens} & \textbf{Methods} & \textbf{SR \% $\uparrow$} & \textbf{FLOPs $\downarrow$} & \textbf{Latency (ms) $\downarrow$} \\
+\midrule
+0 & Baseline & 84.4 & 1.888 & 52.37 \\
+\midrule
+\multirow{3}{*}{50}
+  & SparseVLM & 79.8 & \textbf{1.358} & 88.08 \\
+  & FastV     & 84.6 & 1.888          & 53.10 \\
+  & Ours      & \textbf{85.4} & 1.611 & \textbf{33.43} \\
+\midrule
+\multirow{3}{*}{100}
+  & SparseVLM & 74.6 & \textbf{1.097} & 61.01 \\
+  & FastV     & 83.4 & 1.888          & 45.72 \\
+  & Ours      & \textbf{83.8} & 1.295 & \textbf{31.29} \\
+\midrule
+\multirow{3}{*}{200}
+  & SparseVLM & 44.4 & \textbf{0.735} & 57.42 \\
+  & FastV     & 72.8 & 1.888          & 45.19 \\
+  & Ours      & \textbf{68.3} & 0.823 & \textbf{30.29} \\
+\bottomrule
+\end{tabular}
+}
+\vskip -0.2in
+\label{tab:libero_ablation}
+\end{wraptable}
+
+

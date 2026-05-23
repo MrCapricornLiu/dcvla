@@ -1,0 +1,56 @@
+\section{Appendix}
+
+
+\subsection{Experimental Environment}
+All experiments are conducted under a unified hardware and software configuration to ensure fair comparison across methods and benchmarks.
+Unless otherwise stated, the evaluation environment is as follows.
+
+\begin{itemize}
+    \item \textbf{GPU:} NVIDIA RTX 5880 Ada GPU with 48\,GB memory.
+    \item \textbf{CPU:} Dual-socket AMD EPYC 9654 processors (96 cores per socket, 192 cores total, 384 threads).
+    \item \textbf{CUDA / Driver:} CUDA~13.0 with NVIDIA driver version~580.65.06.
+\end{itemize}
+
+All latency measurements are obtained using CUDA events and exclude environment simulation and robot actuation overhead.
+
+\subsection{Vision Encoder Configuration}
+Unless otherwise specified, the visual observation at each timestep is resized to $224\times224$ and processed by a ViT-based vision encoder.
+Images are partitioned into non-overlapping patches of size $14\times14$, resulting in
+\[
+P = (224 / 14)^2 = 256
+\]
+visual patches per frame.
+We evaluate two widely used vision backbones in OpenVLA-style models: DINOv2 and SigLIP.
+These configurations are kept identical across baselines and CTR-enabled variants to isolate the effect of coordinated token reuse.
+
+\subsection{Benchmarks}
+We evaluate CTR on two complementary simulation benchmarks that cover a wide spectrum of manipulation behaviors.
+
+\textbf{LIBERO} is used as the primary benchmark and includes four task suites:
+\textit{Spatial} (precise object placement and spatial reasoning),
+\textit{Object} (single-object manipulation with diverse geometries),
+\textit{Goal} (goal-conditioned, multi-step manipulation),
+and \textit{Long} (long-horizon tasks requiring temporal consistency).
+For LIBERO experiments, we use the official OpenVLA-7B checkpoint that has been fine-tuned on the corresponding LIBERO task suites.
+
+To assess generalization beyond LIBERO, we additionally evaluate on \textbf{SimplerEnv}, a tabletop manipulation benchmark with different object layouts and visual statistics.
+We report results on three representative tasks: \textit{Move Near Object}, \textit{Pick Coke Can}, and \textit{Drawer Operations}.
+For SimplerEnv, we use the original OpenVLA-7B checkpoint without any task-specific fine-tuning.
+All CTR hyperparameters are kept identical to those used in LIBERO experiments.
+
+\subsection{Model Variants and Checkpoints}
+We evaluate two VLA backbones: OpenVLA and OpenVLA-OFT.
+All experiments use officially released OpenVLA-7B checkpoints.
+CTR is applied strictly at inference time and does not modify model weights, training data, or optimization procedures.
+Both the baseline and CTR-enabled models share identical architectures and token layouts.
+
+
+\subsection{Qualitative Visualization of an Inference Trajectory}
+Figure~\ref{fig:appendix_trajectory} visualizes a complete closed-loop VLA inference trajectory from a single manipulation episode. The figure highlights that most visual regions remain unchanged across consecutive timesteps, which motivates exploiting temporal redundancy via token reuse.
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=1.0\linewidth]{figures/grid_2x6_phase.png}
+    \caption{A complete closed-loop VLA inference trajectory from a single manipulation episode. Consecutive frames exhibit strong temporal redundancy, with only localized regions changing over time.}
+    \label{fig:appendix_trajectory}
+\end{figure*}

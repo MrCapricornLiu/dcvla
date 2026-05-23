@@ -184,7 +184,7 @@ results*/
 
 scripts/
 
-Papers/
+# Papers/
 
 results_old/
 results_different2patchs/
@@ -197,7 +197,7 @@ scripts_openvlaoft/
 
 # Local paper/review workspaces and agent transcripts
 acl/
-review/
+# review/
 sessions/
 
 # Local third-party benchmark checkouts

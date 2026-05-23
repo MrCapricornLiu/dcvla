@@ -1,0 +1,172 @@
+\documentclass[lettersize,journal]{IEEEtran}
+\usepackage{amsmath,amsfonts}
+\usepackage{algorithmic}
+\usepackage{algorithm}
+\usepackage{array}
+\usepackage[caption=false,font=normalsize,labelfont=sf,textfont=sf]{subfig}
+\usepackage{textcomp}
+\usepackage{stfloats}
+\usepackage{url}
+\usepackage{verbatim}
+\usepackage{graphicx}
+\usepackage{cite}
+\hyphenation{op-tical net-works semi-conduc-tor IEEE-Xplore}
+% updated with editorial comments 8/9/2021
+
+\begin{document}
+
+\title{Coordinated Dual-Cache Reuse for Accurate and Efficient Inference in Vision-Language-Action Models}
+
+\author{IEEE Publication Technology,~\IEEEmembership{Staff,~IEEE,}
+        % <-this % stops a space
+\thanks{This paper was produced by the IEEE Publication Technology Group. They are in Piscataway, NJ.}% <-this % stops a space
+\thanks{Manuscript received April 19, 2021; revised August 16, 2021.}}
+
+% The paper headers
+\markboth{Journal of \LaTeX\ Class Files,~Vol.~14, No.~8, August~2021}%
+{Shell \MakeLowercase{\textit{et al.}}: A Sample Article Using IEEEtran.cls for IEEE Journals}
+
+\IEEEpubid{0000--0000/00\$00.00~\copyright~2021 IEEE}
+% Remember, if you use this you must call \IEEEpubidadjcol in the second
+% column for its text to clear the IEEEpubid mark.
+
+\maketitle
+
+\begin{abstract}
+Vision-language-action (VLA) policies suffer from redundant computation across consecutive frames, where large regions of the scene remain static while the model repeatedly re-encodes the entire visual stream. We propose a training-free dual-cache system that reuses computation at both the visual encoder and the language model. Our method identifies static, task-irrelevant patches using a two-stage criterion---temporal appearance consistency and attention-based relevance---and reuses cached representations for those patches while recomputing dynamic or task-relevant regions. The same reuse mask is applied coherently to the Vision Encoder and LLM caches, enabling end-to-end acceleration without modifying the model architecture or requiring finetuning. Experimental results on robotic manipulation tasks show that our method simultaneously improves inference efficiency and task success rates, validating the effectiveness of dual-level cache reuse in achieving both accuracy and efficiency.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Vision-language-action models, cache reuse, inferrence efficiency, vision transformer, large language models
+\end{IEEEkeywords}
+
+\section{Introduction}
+TBD.
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=0.93\textwidth]{flowchart.png}
+    \caption{Overview of the proposed training-free dual-cache inference framework. 
+    Given consecutive observations $I_{t-1}$ and $I_t$, a two-stage patch selection strategy is applied to identify reusable regions. 
+    Stage (1) evaluates temporal consistency using appearance similarity metrics to obtain static patch candidates $\mathcal{S}$. 
+    Stage (2) estimates task relevance from previous-step LLM attention and selects the top-$K$ task-critical patches $\mathcal{A}$. 
+    The final reusable set is computed as $\mathcal{R} = \mathcal{S} \setminus \mathcal{A}$, yielding a patch-level reuse mask $m_t$. 
+    The same mask is shared across the visual encoder and the language model: static, task-irrelevant patches reuse cached attention and MLP outputs in the ViT, while the corresponding visual tokens are pruned during LLM prefill and their cached key/value states are reused. 
+    This coordinated dual-level reuse enables efficient inference without model modification or finetuning, producing the action output $a_t$.}
+    \label{fig:overview}
+\end{figure*}
+
+\section{Related Work}
+TBD.
+
+
+\section{Method}
+\subsection{Problem Setting}
+We consider a VLA policy that maps an image $I_t$ and a textual prompt to an action. The model consists of a visual encoder (ViT), a projector, and a causal LLM. The ViT partitions the image into $P$ patches and outputs patch embeddings, which are projected and concatenated with text tokens before being processed by the LLM. In closed-loop robot control, consecutive frames are highly redundant; recomputing all patches and decoder states at every step wastes significant computation. Our objective is to leverage temporal redundancy to enable cross-frame reuse of hidden layer representations for repetitive visual content across both the Vision Encoder and the LLM, without requiring any retraining.
+
+\subsection{Dual-Cache Framework}
+We formulate dual-level reuse as a unified temporal caching strategy that couples the visual encoder and the language model through a single patch-level mask. Let $m_t \in \{0,1\}^P$ denote the reuse mask at time $t$, where $m_t(p)=1$ indicates a patch deemed reusable from the previous frame. The mask is applied consistently at two levels: (i) within the ViT, where static patches reuse cached sublayer outputs and dynamic patches are recomputed, and (ii) within the LLM, where reusable visual token positions are exempted from prefill recomputation and their key/value states are inherited from the previous frame. This shared mask enforces cross-module consistency: the same static regions are treated identically by the visual and language components, while dynamic or task-relevant regions are refreshed. The token ordering is preserved, and the model architecture remains unchanged, enabling training-free acceleration without disrupting standard VLA inference. Figure~\ref{fig:overview} summarizes this unified reuse pipeline.
+
+
+\subsection{Two-Stage Patch Selection}
+We determine the reuse mask using a two-stage criterion that combines temporal consistency and task relevance.
+
+\textbf{Stage 1: Temporal Consistency.} Each image is partitioned into $P$ patches, and we compute a similarity or difference score per patch between $I_{t-1}$ and $I_t$. We support cosine similarity of patch RGB vectors as well as pixel-difference criteria (grayscale or RGB). A patch is marked static if it exceeds a cosine threshold or falls below a pixel-difference threshold, yielding a static candidate set $\mathcal{S}$.
+
+\textbf{Stage 2: Task Relevance.} We estimate patch relevance using LLM attention from the previous step. Specifically, we aggregate text-to-vision attention and select the top-$K$ patches with highest relevance, denoted $\mathcal{A}$. These patches are treated as task-critical and are always recomputed.
+
+The final reusable set is
+\[
+\mathcal{R} = \mathcal{S} \setminus \mathcal{A},
+\]
+and the reuse mask is $m_t(p)=1$ iff $p \in \mathcal{R}$. Intuitively, $\mathcal{R}$ contains patches that are both temporally stable and weakly related to the current task, making them safe to reuse without harming performance.
+
+\subsection{ViT-Side Reuse}
+The ViT cache stores intermediate outputs of each block. For static patches, we directly reuse the cached attention output and cached MLP output; dynamic patches are computed normally. This yields a simple, training-free mechanism to skip both attention and MLP computation on static regions while preserving the full token sequence.
+
+\textbf{Why not direct KV reuse in ViT?} Cross-frame reuse of K/V is the most direct way to accelerate attention, but ViTs do not natively expose a KV cache in standard inference. Implementing KV reuse would require rewriting attention kernels and cache management. We instead reuse the attention and MLP sublayer outputs, which is easier to integrate into existing ViT implementations and still removes the dominant per-layer computation on static patches.
+\textbf{Keyframe refresh.} Because ViT reuse operates on intermediate sublayer outputs, repeated reuse can accumulate feature drift. We therefore adopt a periodic keyframe strategy: every $K$ steps (or at the first frame), all patches are recomputed and the ViT cache is refreshed. Between keyframes, only patches in $\mathcal{R}$ are reused. This limits error accumulation while retaining most of the computational savings.
+\subsection{LLM-Side Reuse}
+We build on the VLA-Cache mechanism and extend it with a unified, vision-driven reuse mask that is shared with the ViT. The mask identifies static, task-irrelevant visual token positions, and at selected decoder layers we prune the current prefill sequence to skip recomputation of those positions. The corresponding K/V states are taken from past\_key\_values, while dynamic and task-relevant tokens are recomputed. This yields decoder-side savings that are aligned with the visual reuse decisions, ensuring consistent cross-frame semantics across the ViT and LLM.
+
+\subsection{Training-Free Implementation and Overhead}
+Our method introduces no new parameters and requires no finetuning. It operates purely at inference time through mask construction and cache reuse. The temporal consistency check and attention-based relevance filtering are lightweight compared to full ViT/LLM computation. Because the same reuse mask is applied consistently across ViT and LLM, the method avoids cross-module inconsistencies and improves inference efficiency while maintaining or improving task success rates.
+
+\begin{algorithm}[t]
+\caption{Coordinated Dual-Cache Inference}
+\label{alg:dual_cache}
+\begin{algorithmic}
+\STATE \textbf{Input:} current frame $I_t$, previous frame $I_{t-1}$, previous attention $A_{t-1}$, caches $\mathcal{C}^{\text{ViT}}_{t-1}, \mathcal{C}^{\text{LLM}}_{t-1}$
+\STATE \textbf{Output:} action $a_t$, updated caches $\mathcal{C}^{\text{ViT}}_{t}, \mathcal{C}^{\text{LLM}}_{t}$
+\IF{IsKeyframe($t$)}
+    \STATE $m_t \leftarrow \mathbf{0}$ \COMMENT{disable reuse}
+    \STATE $V_t \leftarrow \text{ViT}(I_t)$
+\ELSE
+    \STATE $V_t \leftarrow \text{ViT}(I_t)$ \COMMENT{for dynamic patches only}
+    \STATE $\mathcal{S} \leftarrow \text{StaticSelect}(I_{t-1}, I_t)$ \COMMENT{temporal consistency}
+    \STATE $\mathcal{A} \leftarrow \text{TopKAttn}(A_{t-1})$ \COMMENT{task relevance}
+    \STATE $\mathcal{R} \leftarrow \mathcal{S} \setminus \mathcal{A}$; build mask $m_t$
+    \FOR{each patch $i$}
+        \IF{$m_t(i)=1$}
+            \STATE reuse ViT cache for patch $i$ from $\mathcal{C}^{\text{ViT}}_{t-1}$
+        \ENDIF
+    \ENDFOR
+\ENDIF
+\STATE apply LLM pruning at selected layers using $\mathcal{R}$; reuse K/V from $\mathcal{C}^{\text{LLM}}_{t-1}$
+\STATE $a_t \leftarrow \text{LLM}(\text{Project}(V_t))$
+\STATE update $\mathcal{C}^{\text{ViT}}_{t}$ and $\mathcal{C}^{\text{LLM}}_{t}$ with recomputed tokens
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Theoretical Complexity}
+We provide a concise complexity account that aligns with the implemented dual-cache reuse. Let $p$ be the number of visual patches, $L_t$ the number of text tokens, $L_v=p$ the number of visual tokens, and $D_v, M_v$ ($D_l, M_l$) the ViT (LLM) hidden size and MLP width.
+
+\textbf{Selection cost.} Temporal selection compares patch appearance between $I_{t-1}$ and $I_t$. With patch size $p_s$ and image size $H\times H$, the number of patches is $p=(H/p_s)^2$, yielding
+\begin{equation}
+    C_{\text{static}} = \mathcal{O}(p p_s^2) = \mathcal{O}(H^2).
+    \label{eq:static_cost}
+\end{equation}
+Task-relevance filtering aggregates text-to-vision attention, with
+\begin{equation}
+    C_{\text{attn}} = \mathcal{O}(L_t L_v D_l).
+    \label{eq:attn_filter}
+\end{equation}
+These overheads are linear in token count and are small relative to Transformer compute.
+
+\textbf{ViT-side savings.} A ViT block has the standard FLOP form
+\begin{equation}
+    C_{\text{ViT}}(p) \approx 4 p D_v^2 + 2 p^2 D_v + 2 p D_v M_v.
+    \label{eq:vit_flops}
+\end{equation}
+If a fraction $\rho_v$ of patches is reusable, the recomputed count is $p'=(1-\rho_v)p$ and $p-p'=\rho_v p$. The per-layer reduction is
+\begin{equation}
+    \Delta C_{\text{ViT}} = 4(\rho_v p)D_v^2 + 2\big(1-(1-\rho_v)^2\big)p^2 D_v + 2(\rho_v p)D_v M_v.
+    \label{eq:vit_savings}
+\end{equation}
+
+\textbf{LLM-side savings.} The LLM processes $L=L_t+L_v$ tokens in prefill. With reuse ratio $\rho_l$, the recomputed length is $L'=L_t+(1-\rho_l)L_v$ and $L-L'=\rho_l L_v$. Using the same FLOP form,
+\begin{equation}
+    C_{\text{LLM}}(L) \approx 4 L D_l^2 + 2 L^2 D_l + 2 L D_l M_l,
+    \label{eq:llm_flops}
+\end{equation}
+we obtain
+\begin{equation}
+    \Delta C_{\text{LLM}} = 4(\rho_l L_v)D_l^2 + 2\big(L^2-(L')^2\big)D_l + 2(\rho_l L_v)D_l M_l.
+    \label{eq:llm_savings}
+\end{equation}
+which can be equivalently written as $2(L+L')(L-L')D_l$ for the quadratic term.
+
+\textbf{Total savings.} Summing across layers and subtracting selection overhead yields
+\begin{equation}
+    \Delta C_{\text{total}} = \sum_l \big(\Delta C_{\text{ViT}} + \Delta C_{\text{LLM}}\big) - (C_{\text{static}} + C_{\text{attn}}).
+    \label{eq:total_savings}
+\end{equation}
+The dominant terms in both $\Delta C_{\text{ViT}}$ and $\Delta C_{\text{LLM}}$ scale quadratically with sequence length, so moderate reuse ratios yield substantial reductions, while the selection overhead remains linear.
+
+\section{Experiments}
+TBD.
+
+\section{Conclusion}
+TBD.
+
+\end{document}

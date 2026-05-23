@@ -1,0 +1,492 @@
+\documentclass[11pt]{article}
+
+\usepackage[review]{acl}
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage{amsmath}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{inconsolata}
+\usepackage{graphicx}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{amssymb}
+\usepackage{pifont}
+\newcommand{\cmark}{\ding{51}} 
+\newcommand{\xmark}{\ding{55}} 
+
+\title{Coordinated Cross-Modal Token Reuse with a Unified Mask for Accurate and Efficient Inference in VLA Models}
+
+\author{First Author \\
+  Affiliation / Address line 1 \\
+  Affiliation / Address line 2 \\
+  Affiliation / Address line 3 \\
+  \texttt{email@domain} \\ \And
+  Second Author \\
+  Affiliation / Address line 1 \\
+  Affiliation / Address line 2 \\
+  Affiliation / Address line 3 \\
+  \texttt{email@domain} \\}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Vision-language-action (VLA) inference exhibits substantial redundancy across consecutive frames: large regions of the visual input remain unchanged, yet the model repeatedly re-encodes the entire scene. We present a training-free approach for efficient and accurate VLA inference based on \emph{coordinated cross-modal token reuse}. Our method introduces a \emph{unified mask} that identifies static and task-irrelevant visual patches using a two-stage criterion combining temporal appearance consistency and attention-based relevance. The unified mask drives reuse consistently in both the vision encoder and the language model: cached visual representations are reused for selected patches, while dynamic or task-critical regions are recomputed. This coordinated reuse preserves cross-modal consistency and enables end-to-end acceleration without modifying model architecture or requiring finetuning. Experiments on robotic manipulation tasks show that the proposed approach improves inference efficiency while maintaining or improving task success rates, validating the effectiveness of unified, cross-modal token reuse in VLA models.
+\end{abstract}
+
+\section{Introduction}
+Vision-language-action (VLA) models map visual observations and natural language instructions to low-level control actions, enabling end-to-end robotic manipulation \citep{zitkovich2023rt,octo_2023,kim24openvla,black2024pi_0}. Recent open-source VLA systems demonstrate strong generalization across tasks and environments, but their inference cost remains high due to repeated processing of redundant visual content \citep{liu2024robomamba,wen2024tinyvla,DeeR-VLA}. In closed-loop control, consecutive frames are highly correlated: most visual regions remain static, while only small areas around the end-effector or target objects change. Nevertheless, standard VLA inference recomputes all visual tokens and decoder states at every step, resulting in unnecessary computation and limiting control frequency.
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\textwidth]{figures/VLA-Framework.pdf}
+\caption{\textbf{Overview of a standard VLA inference pipeline and the target of optimization.}
+At each timestep, the model processes the current observation image through a ViT-based vision encoder to obtain visual tokens, which are projected and concatenated with language instruction tokens and fed into an autoregressive LLM to predict robot actions.
+In closed-loop control, this pipeline recomputes all visual tokens and decoder states at every step despite high frame-to-frame redundancy.
+Our method targets this redundancy by introducing synchronized token reuse across the vision encoder and the language model, while keeping the original inference structure and token ordering unchanged.}
+\label{fig:VLA-Framework}
+\end{figure*}
+
+In this work, we address efficient VLA inference from a cross-modal perspective. We propose a training-free approach that coordinates token reuse across the vision encoder and the language model using a single, unified decision variable. Specifically, we introduce a \emph{unified mask} that selects reusable visual patches based on a two-stage criterion: temporal appearance consistency identifies static regions, while text-to-vision attention highlights task-critical regions \citep{xu2025vla}. On the vision-encoder side, cached attention and MLP outputs are reused for selected patches, while dynamic regions are recomputed; a lightweight keyframe refresh mitigates error accumulation \citep{liu2025ttf}. On the language-model side, the same unified mask governs reuse of cached key--value states during the prefill stage \citep{xu2025vla}. By enforcing consistent reuse decisions across modalities, our approach preserves visual--language alignment and improves inference efficiency without modifying model architectures or introducing additional training. Figure~\ref{fig:VLA-Framework} provides an overview of the setting, and Figure~\ref{fig:TokenReuse-Framework} illustrates how the unified mask coordinates token reuse across the two modules.
+
+Our contributions are threefold:
+(1) we introduce a coordinated cross-modal token reuse mechanism for VLA inference, in which reuse decisions are synchronized across the vision encoder and the language model via a unified mask;
+(2) we propose a training-free patch selection strategy that balances temporal stability and task relevance, supporting flexible appearance- and attention-based scoring; and
+(3) we demonstrate through extensive experiments that coordinated reuse improves inference efficiency while maintaining or improving task success rates across multiple benchmarks.
+
+\section{Related Work}
+\noindent\textbf{VLA Inference Optimization.}
+VLA models inherit large vision--language model backbones and benefit from strong multimodal understanding, yet their high inference cost limits real-time control and increases sensitivity to visual noise. Existing optimization approaches can be broadly categorized into training-aware and training-free methods. Training-aware methods modify model architectures, such as introducing lightweight vision encoders or specialized action heads, and require retraining to maintain performance \citep{wen2024tinyvla,DeeR-VLA,zhang2025mole,liu2024robomamba}. In contrast, training-free methods exploit redundancy during inference, including pruning tokens or layers within a frame \citep{yang2025efficientvla}, reusing caches across frames \citep{xu2025vla}, and reusing visual tokens to stabilize inference \citep{liu2025ttf}. Our work builds on this line by coordinating reuse across the vision encoder and the language model using a \emph{unified mask} as a shared decision rule.
+
+\noindent\textbf{Token Processing Techniques.}
+Efficient token processing in multimodal Transformers has been extensively studied through pruning, merging, and sparse attention mechanisms \citep{chen2024image,zhang2024sparsevlm,bolya2022token,cao2023pumer,dynamicvit2021,adavit2022,evit2022}. These approaches primarily focus on reducing intra-frame computation and may degrade spatial fidelity or overlook temporal redundancy. Temporal reuse strategies, by contrast, are well suited to settings such as robotic control where visual content changes slowly over time. Existing methods typically target either the visual pathway or the language decoder in isolation. Our approach adopts a temporal perspective and emphasizes \emph{cross-modal coordination}, ensuring that reuse decisions are consistent across both components.
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\textwidth]{figures/TokenReuse-Framework.pdf}
+    \caption{\textbf{Coordinated cross-modal token reuse driven by a unified mask.}
+Given consecutive frames, we construct a unified patch-level mask using a two-stage criterion: temporal appearance consistency identifies static regions, while text-to-vision attention highlights task-relevant patches.
+The same mask is applied consistently to both modules: in the vision encoder, selected patch representations are reused from cache while others are recomputed; in the language model, the corresponding visual token positions reuse cached key--value states during prefill.
+By synchronizing reuse decisions across modalities, the approach preserves visual--language alignment while reducing redundant computation.}
+\label{fig:TokenReuse-Framework}
+\end{figure*}
+
+\section{Methodology}
+\subsection{Problem Setting}
+We consider a VLA policy that maps an image $I_t$ and a textual prompt to an action. The model consists of a vision encoder (implemented as a Vision Transformer, ViT), a projector, and a large language model (LLM) \citep{vaswani2017attention,touvron2023llama,bai2023qwen,team2024gemma}. The vision encoder partitions the image into $P$ patches and outputs patch embeddings, which are projected and concatenated with text tokens before being processed by the language model. In closed-loop control, consecutive frames are highly redundant; recomputing all patches and decoder states at every step wastes significant computation. Our objective is to exploit temporal redundancy by reusing hidden representations across frames in both the vision encoder and the language model, without retraining.
+
+
+\subsection{Cross-Modal Reuse via a Unified Mask}
+We formulate dual-level reuse as a unified temporal caching strategy that couples the vision encoder and the language model through a single \emph{unified mask}. Let $m_t \in \{0,1\}^P$ denote the unified mask at time $t$, where $m_t(p)=1$ indicates that patch $p$ is reusable from the previous frame. The same mask is applied consistently at two levels: (i) within the vision encoder, where selected patches reuse cached sublayer outputs and other patches are recomputed; and (ii) within the language model, where reusable visual token positions skip prefill recomputation and inherit cached key--value states from the previous frame. This design enforces cross-modal consistency, preventing semantic mismatch caused by independent reuse decisions. Token ordering and model architecture remain unchanged, enabling training-free acceleration under standard VLA inference.
+We refer to this mechanism as \emph{cross-modal token reuse}: on the vision side it is implemented as reuse of cached sublayer outputs, and on the language side as reuse of cached key/value states.
+
+\subsection{Two-Stage Patch Selection}
+We determine the unified mask using a two-stage criterion that combines temporal consistency and task relevance. Let $\pi(\cdot)$ denote patchification into $P$ non-overlapping patches. For each patch $p$, we first compute a temporal consistency score between $I_{t-1}$ and $I_t$:
+\begin{equation}
+    s_t(p) = \mathrm{Sim}\!\left(\pi(I_{t-1})_p,\ \pi(I_t)_p\right),
+    \label{eq:temporal_sim}
+\end{equation}
+where $\mathrm{Sim}$ is either cosine similarity in pixel space or a pixel-difference metric. We mark a patch as static if $s_t(p)$ exceeds a similarity threshold (or falls below a difference threshold), yielding a static candidate set $\mathcal{S}_t$. The dynamic set is its complement $\mathcal{D}_t = \mathcal{S}_t^{c}$.
+
+Next, we use text-to-vision attention from the previous step to identify task-relevant patches; task relevance is always computed from $t-1$. Let $a_{t-1}(p)$ denote the aggregated attention score from text tokens to patch $p$ at time $t-1$. We select the top-$K$ patches,
+\begin{equation}
+    \mathcal{A}_{t-1} = \mathrm{TopK}\!\left(\{a_{t-1}(p)\}_{p=1}^{P}\right),
+    \label{eq:attn_topk}
+\end{equation}
+and force them to be recomputed. The recompute set is therefore
+\begin{equation}
+    \mathcal{C}_t = \mathcal{D}_t \cup \mathcal{A}_{t-1},
+    \label{eq:recompute_set}
+\end{equation}
+and the reusable set is
+\begin{equation}
+    \mathcal{R}_t = \mathcal{C}_t^{c},\quad m_t(p)=\mathbb{1}[p \in \mathcal{R}_t].
+    \label{eq:reuse_mask}
+\end{equation}
+This design ensures that only patches that are temporally stable and not task-relevant are reused; dynamic or task-relevant patches are recomputed. The same $m_t$ is then applied consistently to both the vision encoder and the language model, so the two modules operate on aligned visual content.
+
+\subsection{Vision-Encoder-Side Reuse}
+Let $H_t^{(\ell)} \in \mathbb{R}^{P \times d_v}$ denote the patch embeddings at layer $\ell$ of the vision encoder. We cache the attention and MLP sublayer outputs for each patch from time $t-1$ and reuse them when $m_t(p)=1$. We denote the resulting representation after reuse as $\hat{H}_t^{(\ell)}$. Formally, for each patch $p$:
+\begin{equation}
+    \hat{H}_t^{(\ell)}(p)=
+    \begin{cases}
+    \mathrm{Cache}_{t-1}^{(\ell)}(p), & m_t(p)=1,\\
+    \mathrm{VE}^{(\ell)}\!\left(H_t^{(\ell-1)}(p)\right), & m_t(p)=0,
+    \end{cases}
+    \label{eq:ve_reuse}
+\end{equation}
+where $\mathrm{VE}^{(\ell)}(\cdot)$ denotes the standard block computation used to obtain the representation for non-reused patches (with reused patches treated as constants). In practice, we treat reused patch representations as constants and only recompute the representations for non-reused patches, then merge them back into the full sequence at each Transformer block, caching the block outputs from the previous frame. We reuse the post-block patch representations (after the residual connection), which can be cached and merged without altering layer normalization or token ordering. This is an approximation because self-attention couples tokens; we do \emph{not} shorten the sequence or modify the attention kernel. Concretely, for reused patches we carry over the post-block representations from $t-1$ and treat them as constants, while non-reused patches are recomputed using the full sequence that includes these constant tokens. Empirically, the approximation is stable under keyframe refresh while reducing the dominant per-layer computation on static patches. This approximation is most effective in settings where inter-patch interactions are dominated by local or low-frequency dynamics, as is common in closed-loop robotic control with slowly changing backgrounds. The full token sequence is preserved and the model architecture is unchanged.
+
+Operationally, the reuse decision is applied at every Transformer block. For each block, we (i) form the full token sequence by combining cached (reused) patch representations with the recomputed patch representations, (ii) run the standard block computation only on the non-reused patches, and (iii) write the resulting post-block representations back into the cache. This yields a consistent per-layer cache of post-block patch embeddings that is used at the next timestep. The computational savings come from skipping the linear projections and MLP for reused patches while still allowing non-reused patches to attend to the full sequence.
+
+Direct cross-frame key--value reuse inside ViT attention would require intrusive kernel changes and careful cache management. By reusing sublayer outputs instead, we keep the implementation minimal while still skipping substantial computation on static patches. To prevent error accumulation from repeated reuse, we apply a keyframe refresh: every $K$ steps, all patches are recomputed and the cache is fully updated.
+
+\subsection{LLM-Side Reuse}
+
+On the language-model side, we build upon existing token-level cache reuse mechanisms for VLA inference~\citep{xu2025vla}, and extend them with a unified, cross-modal control signal.
+Specifically, instead of making reuse decisions solely based on language-model-internal heuristics, we apply the unified mask $m_t$—constructed from visual temporal consistency and task relevance—to the visual token positions in the decoder.
+This design aligns language-model-side reuse decisions with those made in the vision encoder, enforcing cross-modal consistency across timesteps.
+
+During the prefill stage, visual tokens corresponding to reusable patches reuse their cached key--value states from the previous timestep, while the remaining tokens are recomputed:
+\begin{equation}
+    \mathrm{KV}_t(p)=
+    \begin{cases}
+    \mathrm{KV}_{t-1}(p), & p \in \mathcal{R}_t,\\
+    \mathrm{KV}_t^{\text{new}}(p), & p \in \mathcal{D}_t,
+    \end{cases}
+    \label{eq:llm_reuse}
+\end{equation}
+where $\mathrm{KV}_t^{\text{new}}(p)$ denotes the key/value states computed at time $t$ for visual token $p$ at the selected decoder layers.
+Unlike prior approaches that apply reuse independently within the language model, the reuse set $\mathcal{R}_t$ here is determined jointly with the vision encoder, ensuring that both modules operate on an aligned set of visual tokens.
+
+Operationally, we prune the visual token positions in $\mathcal{R}_t$ at selected decoder layers so that these positions skip prefill recomputation and directly inherit cached K/V states from the previous timestep.
+Dynamic or task-relevant visual tokens remain in the prefill sequence and update the cache as usual. Pruning can be applied at a fixed subset of decoder layers (e.g., every $r$ layers), and the reuse ratio may be modulated by attention entropy; we find our method to be insensitive to the exact choice of $r$ within a reasonable range.
+
+The reuse mask is applied only to visual token positions; text tokens are always recomputed.
+Token order and sequence layout are preserved, enabling a drop-in implementation compatible with standard autoregressive decoding.
+Cache updates are performed only for recomputed positions, while reused positions retain their cached states from the previous timestep.
+
+By driving language-model-side reuse with the same unified mask used in the vision encoder, CTR elevates cache reuse from a modality-local optimization~\citep{xu2025vla} to a coordinated cross-modal mechanism.
+This synchronization is critical for preserving visual--language alignment across timesteps and plays a key role in the stability and efficiency gains observed in our experiments.
+
+
+\begin{algorithm}[t]
+\caption{Coordinated Token Reuse with a Unified Mask}
+\label{alg:dual_cache}
+\begin{algorithmic}
+\STATE \textbf{Input:} current frame $I_t$, previous frame $I_{t-1}$, previous attention $A_{t-1}$, caches $\mathcal{C}^{\text{VE}}_{t-1}, \mathcal{C}^{\text{LLM}}_{t-1}$
+\STATE \textbf{Output:} action $a_t$, updated caches $\mathcal{C}^{\text{VE}}_{t}, \mathcal{C}^{\text{LLM}}_{t}$
+
+\IF{IsKeyframe($t$)}
+    \STATE $m_t \leftarrow \mathbf{0}$ \COMMENT{disable reuse}
+    \STATE $V_t \leftarrow \text{VisionEncoder}(I_t)$
+\ELSE
+    \STATE $\mathcal{S}_t \leftarrow \text{StaticSelect}(I_{t-1}, I_t)$ \COMMENT{temporal consistency}
+    \STATE $\mathcal{D}_t \leftarrow \mathcal{S}_t^{c}$ \COMMENT{dynamic patches}
+    \STATE $\mathcal{A}_{t-1} \leftarrow \text{TopKAttn}(A_{t-1})$ \COMMENT{task relevance}
+    \STATE $\mathcal{C}_t \leftarrow \mathcal{D}_t \cup \mathcal{A}_{t-1}$ \COMMENT{recompute set}
+    \STATE $\mathcal{R}_t \leftarrow \mathcal{C}_t^{c}$; build unified mask $m_t$
+    \STATE $V_t \leftarrow \text{VisionEncoder}(I_t)$ \COMMENT{reuse or recompute per $m_t$}
+    \FOR{each patch $p$}
+        \IF{$m_t(i)=1$}
+            \STATE reuse vision-encoder cache for patch $p$ from $\mathcal{C}^{\text{VE}}_{t-1}$
+        \ENDIF
+    \ENDFOR
+\ENDIF
+
+\STATE apply LLM prefill pruning using $\mathcal{R}_t$; reuse cached K/V from $\mathcal{C}^{\text{LLM}}_{t-1}$
+\STATE $a_t \leftarrow \text{LLM}(\text{Project}(V_t))$
+\STATE update $\mathcal{C}^{\text{VE}}_{t}$ and $\mathcal{C}^{\text{LLM}}_{t}$ with recomputed tokens
+\end{algorithmic}
+\end{algorithm}
+
+
+\section{Theoretical Analysis}
+We provide a detailed complexity analysis to characterize the scaling behavior of coordinated cross-modal token reuse. The analysis is intended to illustrate relative computational savings rather than exact wall-clock runtime.
+
+Let $p$ denote the number of visual patches, $L_t$ the number of text tokens, and $L_v=p$ the number of visual tokens. Let $D_v, M_v$ ($D_l, M_l$) denote the hidden size and MLP width of the vision encoder (language model), respectively.
+
+\paragraph{Selection overhead.}
+Temporal consistency checking compares patch appearance between $I_{t-1}$ and $I_t$. With patch size $p_s$ and image resolution $H \times H$, the number of patches is $p = (H / p_s)^2$, yielding
+\begin{equation}
+    C_{\text{static}} = \mathcal{O}(p p_s^2) = \mathcal{O}(H^2).
+    \label{eq:static_cost}
+\end{equation}
+Task relevance estimation aggregates text-to-vision attention, with cost
+\begin{equation}
+    C_{\text{attn}} = \mathcal{O}(L_t L_v D_l).
+    \label{eq:attn_filter}
+\end{equation}
+Both costs scale linearly with token count and are negligible compared to Transformer attention.
+
+\paragraph{Vision-encoder-side savings.}
+A standard Transformer block in the vision encoder incurs
+\begin{equation}
+    C_{\text{VE}}(p) \approx 4 p D_v^2 + 2 p^2 D_v + 2 p D_v M_v,
+    \label{eq:vit_flops}
+\end{equation}
+where the quadratic term arises from self-attention. Our implementation preserves the full sequence length, so we do \emph{not} claim a strict $p^2 \!\rightarrow\! (1-\rho_v)^2 p^2$ reduction. Instead, reused patches bypass the dominant linear projections and MLP computations, while attention is still evaluated over the full token set. With reuse ratio $\rho_v$, a conservative per-layer savings estimate is
+\begin{equation}
+\label{eq:vit_savings}
+    \Delta C_{\text{VE}} \approx 4(\rho_v p)D_v^2 + 2(\rho_v p)D_v M_v,
+\end{equation}
+reflecting the skipped projection and MLP costs for static patches. We do not include the quadratic attention score term in this lower-bound estimate, since it is still computed over the full sequence in our implementation. This asymmetry arises because visual-token reuse preserves the full attention graph in the vision encoder, whereas LLM-side pruning directly reduces the effective sequence length during prefill. This estimate aligns with the implementation and provides a lower bound on practical savings.
+
+\paragraph{Language-model-side savings.}
+The language model processes $L=L_t+L_v$ tokens during the prefill stage. With reuse ratio $\rho_l$, the recomputed sequence length becomes $L' = L_t + (1-\rho_l)L_v$. Using the standard Transformer cost
+\begin{equation}
+    C_{\text{LLM}}(L) \approx 4 L D_l^2 + 2 L^2 D_l + 2 L D_l M_l,
+    \label{eq:llm_flops}
+\end{equation}
+the saved computation per layer is
+\begin{equation}
+\label{eq:llm_savings}
+\begin{split}
+    \Delta C_{\text{LLM}} &= 4(\rho_l L_v)D_l^2
+    + 2\big(L^2 - (L')^2\big)D_l \\
+    &\quad + 2(\rho_l L_v)D_l M_l.
+\end{split}
+\end{equation}
+The quadratic term can be equivalently written as $2(L+L')(L-L')D_l$.
+
+\paragraph{Total savings.}
+Summing across layers and subtracting selection overhead yields
+\begin{equation}
+    \Delta C_{\text{total}} =
+    \sum_{\ell} \big(\Delta C_{\text{VE}}^{(\ell)} + \Delta C_{\text{LLM}}^{(\ell)}\big)
+    - (C_{\text{static}} + C_{\text{attn}}).
+    \label{eq:total_savings}
+\end{equation}
+Because the dominant term in $\Delta C_{\text{LLM}}$ (the attention score computation) scales quadratically with sequence length, moderate reuse ratios can yield substantial end-to-end reductions, while the selection overhead remains linear.
+
+\begin{table*}[t]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{2pt}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lcccccc cccccc}
+\toprule
+\textbf{Model / Setting} &
+\multicolumn{6}{c}{\textbf{Spatial}} &
+\multicolumn{6}{c}{\textbf{Object}} \\
+\cmidrule(lr){2-7}\cmidrule(lr){8-13}
+& \textbf{Succ.} & \textbf{$\Delta$Succ(\%)} & \textbf{Lat.(ms)} & \textbf{$\Delta$Lat(\%)} & \textbf{TFLOPs} & \textbf{$\Delta$TF(\%)}
+& \textbf{Succ.} & \textbf{$\Delta$Succ(\%)} & \textbf{Lat.(ms)} & \textbf{$\Delta$Lat(\%)} & \textbf{TFLOPs} & \textbf{$\Delta$TF(\%)} \\
+\midrule
+OpenVLA
+& 0.745 & -- & 57.588 & -- & 2.070 & --
+& 0.665 & -- & 57.277 & -- & 2.045 & -- \\
+OpenVLA + CTR
+& 0.760 & +2.0 & 55.172 & -4.2 & 1.664 & -19.6
+& 0.710 & +6.8 & 54.887 & -4.2 & 1.657 & -18.9 \\
+OpenVLA-OFT
+& 0.950 & -- & 87.248 & -- & 4.499 & --
+& 0.980 & -- & 87.693 & -- & 4.466 & -- \\
+OpenVLA-OFT + CTR
+& 0.960 & +1.1 & 85.895 & -1.6 & 3.949 & -12.2
+& 0.980 & +0.0 & 85.512 & -2.5 & 3.915 & -12.3 \\
+\midrule
+\textbf{Model / Setting} &
+\multicolumn{6}{c}{\textbf{Goal}} &
+\multicolumn{6}{c}{\textbf{Long}} \\
+\cmidrule(lr){2-7}\cmidrule(lr){8-13}
+& \textbf{Succ.} & \textbf{$\Delta$Succ(\%)} & \textbf{Lat.(ms)} & \textbf{$\Delta$Lat(\%)} & \textbf{TFLOPs} & \textbf{$\Delta$TF(\%)}
+& \textbf{Succ.} & \textbf{$\Delta$Succ(\%)} & \textbf{Lat.(ms)} & \textbf{$\Delta$Lat(\%)} & \textbf{TFLOPs} & \textbf{$\Delta$TF(\%)} \\
+\midrule
+OpenVLA
+& 0.725 & -- & 59.260 & -- & 2.023 & --
+& 0.465 & -- & 67.118 & -- & 2.061 & -- \\
+OpenVLA + CTR
+& 0.795 & +9.7 & 54.604 & -7.9 & 1.634 & -19.2
+& 0.480 & +3.2 & 54.813 & -18.3 & 1.675 & -18.7 \\
+OpenVLA-OFT
+& 0.965 & -- & 87.693 & -- & 4.444 & --
+& 0.945 & -- & 86.455 & -- & 4.487 & -- \\
+OpenVLA-OFT + CTR
+& 0.970 & +0.5 & 83.815 & -4.4 & 3.858 & -13.2
+& 0.950 & +0.5 & 83.533 & -3.4 & 3.847 & -14.3 \\
+\bottomrule
+\end{tabular}%
+}
+\caption{Main results on LIBERO suites with per-task success rate and end-to-end efficiency. Latency is reported in ms and TFLOPs in trillions of FLOPs per step; totals are computed as the sum of the vision encoder and LLM measurements per task. $\Delta$ values are relative to the corresponding baseline for each model.}
+\label{tab:main_results}
+\end{table*}
+
+
+
+\section{Experiments}
+We evaluate coordinated cross-modal token reuse (CTR) from three perspectives: (i) task performance across manipulation benchmarks, (ii) end-to-end inference efficiency, and (iii) the individual and combined contributions of vision-side and language-side reuse. Our evaluation spans multiple VLA backbones and environments, and we report both success rates and efficiency metrics.
+
+
+\subsection{Experimental Setup}
+
+\paragraph{Models.}
+We evaluate CTR on two representative VLA architectures: OpenVLA and OpenVLA-OFT. OpenVLA is a standard open-source VLA model with a ViT-based vision encoder and an autoregressive language model, while OpenVLA-OFT is a higher-performing variant with additional fine-tuning. CTR is applied in a strictly training-free manner to both models, without modifying model weights.
+
+
+\paragraph{Benchmarks.}
+We evaluate CTR on two simulation benchmarks that cover diverse manipulation skills and temporal horizons. Our primary benchmark is LIBERO, where we report results on all four suites (Spatial, Object, Goal, and Long-horizon), spanning precise spatial placement, single-object interaction, goal-conditioned multi-step manipulation, and long-horizon sequential tasks. Unless otherwise specified, each suite contains 10 tasks and we evaluate 20 episodes per task (200 episodes per suite). To assess generalization beyond LIBERO without additional tuning, we further evaluate on SimplerEnv, which provides tabletop manipulation scenarios with different object layouts and visual statistics; we report three representative tasks (Move Near Object, Pick Coke Can, and Drawer) with hundreds of evaluation episodes per task (240/300/216, respectively).
+
+\paragraph{Metrics.}
+We report task success rate (percentage of successful episodes) as the primary performance metric. Inference efficiency is measured using model-only CUDA latency (milliseconds per control step) and total TFLOPs, computed as the sum of the vision encoder and language model costs. All efficiency measurements are obtained from the same evaluation runs as success rates and exclude environment/actuation overhead.
+
+\paragraph{Implementation Details.}
+Unless otherwise specified, CTR uses grayscale difference for temporal consistency checking with threshold $0.004$, attention-based top-$K$ selection with $K=160$, and a fixed keyframe interval of $K=5$, which yields a moderate reuse ratio in practice. SimplerEnv uses the same hyperparameters as LIBERO. All experiments are conducted under the same evaluation protocol and hardware configuration to ensure fair comparison.
+
+\subsection{Results}
+
+\subsubsection{Main Results on LIBERO}
+
+Table~\ref{tab:main_results} presents the main results on the LIBERO benchmark. Across all four task suites, CTR improves inference efficiency while maintaining or improving task success rates.
+
+
+
+\begin{table}[t]
+\centering
+\resizebox{\linewidth}{!}{%
+    \begin{tabular}{lcccc}
+    \toprule
+    \textbf{Setting} & \textbf{Move Near} & \textbf{Pick Coke} & \textbf{Drawer} & \textbf{Average} \\
+    \midrule
+    OpenVLA & 49.6 & 17.3 & 32.4 & 33.1 \\
+    OpenVLA + CTR & 51.3 & 19.0 & 33.3 & 34.5 \\
+    \bottomrule
+    \end{tabular}%
+}
+\caption{SimplerEnv results (success rate, \%) using the OpenVLA base checkpoint without task-specific fine-tuning. CTR uses the same hyperparameters as in LIBERO.}
+\label{tab:simplerenv}
+\end{table}
+
+
+
+\begin{table*}[t]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{cccccc ccccc} 
+\toprule
+\multirow{2}{*}{\textbf{LLMCache, VECache}} &
+\multicolumn{5}{c}{\textbf{Spatial}} &
+\multicolumn{5}{c}{\textbf{Object}} \\
+\cmidrule(lr){2-6}\cmidrule(lr){7-11}
+& \textbf{Succ.} & \textbf{VE Lat. (ms)} & \textbf{VE TFLOPs} & \textbf{LLM Lat. (ms)} & \textbf{LLM TFLOPs}
+& \textbf{Succ.} & \textbf{VE Lat. (ms)} & \textbf{VE TFLOPs} & \textbf{LLM Lat. (ms)} & \textbf{LLM TFLOPs} \\
+\midrule
+(\xmark, \xmark) 
+& 0.745 & 12.48 & 0.090 & 32.62 & 1.888
+& 0.665 & 12.38 & 0.093 & 32.50 & 1.857 \\
+(\cmark, \xmark)
+& 0.750 & 12.51 & 0.091 & 31.50 & 1.475
+& 0.705 & 12.42 & 0.094 & 31.42 & 1.468 \\
+(\xmark, \cmark)
+& 0.750 & 11.76 & 0.094 & 32.69 & 1.888
+& 0.685 & 11.63 & 0.095 & 32.40 & 1.857 \\
+(\cmark, \cmark)
+& 0.760 & 11.90 & 0.092 & 31.36 & 1.480
+& 0.710 & 11.77 & 0.093 & 31.32 & 1.470 \\
+\midrule
+\multirow{2}{*}{\textbf{LLMCache, VECache}} &
+\multicolumn{5}{c}{\textbf{Goal}} &
+\multicolumn{5}{c}{\textbf{Long}} \\
+\cmidrule(lr){2-6}\cmidrule(lr){7-11}
+& \textbf{Succ.} & \textbf{VE Lat. (ms)} & \textbf{VE TFLOPs} & \textbf{LLM Lat. (ms)} & \textbf{LLM TFLOPs}
+& \textbf{Succ.} & \textbf{VE Lat. (ms)} & \textbf{VE TFLOPs} & \textbf{LLM Lat. (ms)} & \textbf{LLM TFLOPs} \\
+\midrule
+(\xmark, \xmark)
+& 0.725 & 13.43 & 0.094 & 32.40 & 1.834
+& 0.465 & 17.32 & 0.091 & 32.47 & 1.878 \\
+(\cmark, \xmark)
+& 0.780 & 13.33 & 0.094 & 31.21 & 1.440
+& 0.470 & 17.35 & 0.091 & 31.29 & 1.482 \\
+(\xmark, \cmark)
+& 0.755 & 11.98 & 0.095 & 32.27 & 1.834
+& 0.465 & 11.67 & 0.095 & 32.55 & 1.878 \\
+(\cmark, \cmark)
+& 0.795 & 11.76 & 0.093 & 31.06 & 1.447
+& 0.480 & 11.73 & 0.093 & 31.35 & 1.488 \\
+\bottomrule
+\end{tabular}%
+}
+\caption{Switch ablation on OpenVLA. We independently enable or disable LLM-side cache reuse and VE-side reuse, and report per-task success rate, VE/LLM latency (ms), and TFLOPs. Latency is measured with CUDA events and averaged after warmup.}
+\label{tab:ablation_switch}
+\end{table*}
+
+
+
+\paragraph{Overall Performance Trends.}
+On the OpenVLA backbone, CTR improves success rates across Spatial, Object, and Goal tasks, with the largest gain observed on the Goal suite (+9.7\%). These gains are achieved while reducing total TFLOPs by approximately 18--20\% and lowering end-to-end latency by up to 18.3\%. This indicates that coordinated reuse can accelerate inference and improve policy stability in closed-loop control.
+
+On OpenVLA-OFT, CTR preserves the already high success rates while still delivering efficiency gains (12--14\% TFLOPs reduction). The smaller improvements are expected given the strong baseline. Importantly, CTR does not degrade performance in this regime.
+
+\paragraph{Long-Horizon Tasks.}
+Long-horizon tasks benefit particularly from CTR. On OpenVLA, CTR improves success rate from 0.465 to 0.480 while reducing latency by 18.3\%. This suggests that coordinated cross-modal reuse stabilizes inference across consecutive frames, which is especially helpful when errors can accumulate over long action sequences.
+
+\paragraph{Efficiency-Accuracy Trade-off.}
+Across all suites, CTR achieves efficiency gains without a clear accuracy--efficiency trade-off in the reported results. In several cases (e.g., Goal and Object tasks), success rates improve alongside reduced computation, indicating that suppressing redundant visual updates can reduce noise and improve temporal consistency.
+
+
+
+\subsubsection{Cross-Environment Evaluation on SimplerEnv}
+
+To evaluate generalization beyond the LIBERO benchmark, we report results on SimplerEnv in Table~\ref{tab:simplerenv}. All experiments use the OpenVLA base checkpoint without task-specific fine-tuning, and CTR parameters are kept identical to those used on LIBERO.
+
+CTR consistently improves success rates across all three tasks, yielding an average improvement of 1.4 percentage points. The largest relative gain is observed on the Pick Coke task, which involves precise grasping under varying object poses. These results demonstrate that CTR generalizes across environments with different visual statistics and task structures, without requiring parameter tuning or retraining.
+
+The consistent gains on SimplerEnv suggest that CTR captures a general property of robotic manipulation: most visual regions remain temporally stable, and coordinated reuse of such regions improves robustness across environments.
+
+
+
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Mask Variant} & \textbf{Spatial} & \textbf{Object} & \textbf{Goal} & \textbf{Long} & \textbf{Avg.} \\
+\midrule
+CTR (ours) & 76.0 & 71.0 & 79.5 & 48.0 & 68.6 \\
+LLM mask high & 73.5 & 66.5 & 74.5 & 39.0 & 63.4 \\
+LLM mask low & 73.5 & 70.0 & 73.0 & 40.0 & 64.1 \\
+VE mask high & 72.5 & 70.0 & 73.0 & 39.5 & 63.8 \\
+VE mask low & 74.0 & 70.0 & 79.0 & 40.0 & 65.8 \\
+\bottomrule
+\end{tabular}
+\caption{Mask-consistency ablation on OpenVLA (success rate, \%). We perturb the similarity threshold on only one side (LLM or VE) while keeping the other side fixed. CTR with a consistent mask performs best overall.}
+\label{tab:ablation_mask}
+\end{table}
+
+
+
+
+\subsubsection{Switch Ablation: Vision-Side vs.\ LLM-Side Reuse}
+
+To isolate the contributions of vision-encoder-side reuse and language-model-side reuse, we conduct a switch ablation study on OpenVLA, reported in Table~\ref{tab:ablation_switch}. We independently enable or disable reuse in the vision encoder (ViT) and the language model (VLA cache), resulting in four configurations.
+
+
+
+\paragraph{Independent Effects.}
+Enabling reuse only on the language-model side reduces LLM latency and TFLOPs while slightly improving success rates, confirming prior findings that reusing cached key--value states is effective for VLA inference. Enabling reuse only on the vision side reduces ViT latency and TFLOPs and yields moderate performance gains, indicating that reusing static visual patches does not harm—and can even help—policy execution.
+
+\paragraph{Coordinated Reuse.}
+The full CTR configuration, where both reuse mechanisms are enabled and driven by a unified mask, consistently outperforms either single-sided variant. This indicates that coordinating reuse across modalities helps preserve visual--language alignment.
+
+\paragraph{Complementarity.}
+The ablation results highlight the complementary nature of vision-side and LLM-side reuse. Vision-side reuse primarily reduces early-stage visual computation, while LLM-side reuse skips recomputation for reusable positions at selected layers, reducing prefill compute. CTR combines these benefits while maintaining consistent token semantics across modalities.
+
+\subsubsection{Mask Consistency Ablation}
+Table~\ref{tab:ablation_mask} reports success rates when the reuse mask is perturbed on only one side of the model. Compared to the consistent-mask baseline (OpenVLA + CTR), all mismatched variants reduce average success rate by 2.8--5.2 points, with the largest drops on the Long-horizon suite. This indicates that mask agreement across vision and language modules is beneficial for stable performance, and supports using the unified mask as the default configuration.
+
+
+
+
+
+
+
+
+
+
+\section{Conclusion}
+We presented CTR, a training-free approach for efficient and accurate inference in vision--language--action (VLA) models based on coordinated cross-modal token reuse.
+CTR employs a unified mask to synchronize reuse decisions across the vision encoder and the language model, selectively reusing static and task-irrelevant visual tokens while recomputing dynamic or critical regions.
+Experiments across multiple manipulation benchmarks and VLA backbones show that CTR reduces inference cost while maintaining or improving task success rates, highlighting cross-modal coordination as an effective way to exploit temporal redundancy in VLA inference.
+
+
+\section*{Limitations}
+
+While CTR achieves consistent reductions in computation, the corresponding end-to-end latency improvement is smaller than the TFLOPs reduction, mainly due to engineering factors such as kernel launch overhead, memory access patterns, and limited overlap between computation and data movement; as a result, theoretical compute savings are not always fully reflected in wall-clock latency, especially at smaller batch sizes. In addition, although CTR reuses visual representations across frames, it does not transform the vision encoder into a shorter-sequence model: self-attention in the ViT is still computed over the full $P \times P$ token grid rather than a reduced sequence. This design choice keeps the method training-free and minimally invasive, but also limits the maximum speedup achievable compared to approaches that explicitly shorten the attention sequence.
+
+
+
+\bibliographystyle{acl_natbib}
+\bibliography{custom}
+\clearpage
+\appendix
+\input{appendix}
+
+\end{document}
