@@ -1,0 +1,27 @@
+
+\begin{table*}[t]
+\centering
+\small
+\caption{Comparison of different VLA acceleration methods on the LIBERO benchmark.}
+% \resizebox{1\linewidth}{!}{
+\vskip -0.05in 
+\setlength{\tabcolsep}{2.1mm}{
+\begin{tabular}{lcccccccc}
+\toprule
+\multirow{2}{*}{Method} & \multicolumn{5}{c}{Success Rate $\uparrow$} & \multirow{2}{*}{\shortstack{FLOPs\\(T)$\downarrow$}} & \multirow{2}{*}{\shortstack{Latency\\(ms)$\downarrow$}} & \multirow{2}{*}{\shortstack{Control Freq. \\ (Hz)$\uparrow$}} \\
+\cmidrule(lr){2-6}
+ & Spatial & Object & Goal & Long & Average &  &  &  \\
+\midrule
+OpenVLA & \underline{84.4\%} & \underline{86.6\%} & \underline{75.6\%} & \underline{53.2\%} & \underline{75.0\%} & \underline{1.864} & \underline{51.91} & \underline{4.23} \\
+ + SparseVLM          & 79.8\% & 67.0\% & 72.6\% & 39.4\% & 64.7\% & 1.407 & 83.39 & 3.72 \\
+ + FastV              & 83.4\% & 84.0\% & 74.2\% & 51.6\% & 73.3\% & 1.864 & 53.28 & 4.19 \\
+ + \textbf{VLA-Cache} & \textbf{83.8\%} & \textbf{85.8\%} & \textbf{76.4\%} & \textbf{52.8\%} & \textbf{74.7\%} & \textbf{1.355} & \textbf{31.83} & \textbf{4.59} \\
+\midrule
+OpenVLA-OFT & \underline{97.8\%} & \underline{97.6\%} & \underline{97.6\%} & \underline{94.2\%} & \underline{96.8\%} & \underline{4.013} & \underline{79.05} & \underline{65.10} \\
+ + \textbf{VLA-Cache} & \textbf{98.3\%} & 97.5\% & \textbf{98.3\%} & \textbf{95.4\%} & \textbf{97.4\%} & \textbf{3.097} & \textbf{62.59} & \textbf{78.98} \\
+\bottomrule
+\end{tabular}
+}
+\vskip -0.05in 
+\label{tab:libero_main}
+\end{table*}

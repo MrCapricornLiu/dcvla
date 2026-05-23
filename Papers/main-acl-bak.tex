@@ -1,0 +1,281 @@
+\documentclass[11pt]{article}
+
+% Change "review" to "final" to generate the final (sometimes called camera-ready) version.
+% Change to "preprint" to generate a non-anonymous version with page numbers.
+\usepackage[review]{acl}
+
+% Standard package includes
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage{amsmath}
+
+% For proper rendering and hyphenation of words containing Latin characters (including in bib files)
+\usepackage[T1]{fontenc}
+% For Vietnamese characters
+% \usepackage[T5]{fontenc}
+% See https://www.latex-project.org/help/documentation/encguide.pdf for other character sets
+
+% This assumes your files are encoded as UTF8
+\usepackage[utf8]{inputenc}
+
+% This is not strictly necessary, and may be commented out,
+% but it will improve the layout of the manuscript,
+% and will typically save some space.
+\usepackage{microtype}
+
+% This is also not strictly necessary, and may be commented out.
+% However, it will improve the aesthetics of text in
+% the typewriter font.
+\usepackage{inconsolata}
+
+%Including images in your LaTeX document requires adding
+%additional package(s)
+\usepackage{graphicx}
+
+\usepackage{algorithm}
+\usepackage{algorithmic}
+% If the title and author information does not fit in the area allocated, uncomment the following
+%
+%\setlength\titlebox{<dim>}
+%
+% and set <dim> to something 5cm or larger.
+
+% \title{Coordinated Dual-Cache Reuse for Accurate and Efficient Inference in Vision-Language-Action Models}
+\title{Coordinated Cross-Modal Token Reuse with a Unified Mask for Efficient and Accurate Inference in VLA Models}
+
+% Author information can be set in various styles:
+% For several authors from the same institution:
+% \author{Author 1 \and ... \and Author n \\
+%         Address line \\ ... \\ Address line}
+% if the names do not fit well on one line use
+%         Author 1 \\ {\bf Author 2} \\ ... \\ {\bf Author n} \\
+% For authors from different institutions:
+% \author{Author 1 \\ Address line \\  ... \\ Address line
+%         \And  ... \And
+%         Author n \\ Address line \\ ... \\ Address line}
+% To start a separate ``row'' of authors use \AND, as in
+% \author{Author 1 \\ Address line \\  ... \\ Address line
+%         \AND
+%         Author 2 \\ Address line \\ ... \\ Address line \And
+%         Author 3 \\ Address line \\ ... \\ Address line}
+
+\author{First Author \\
+  Affiliation / Address line 1 \\
+  Affiliation / Address line 2 \\
+  Affiliation / Address line 3 \\
+  \texttt{email@domain} \\ \And
+  Second Author \\
+  Affiliation / Address line 1 \\
+  Affiliation / Address line 2 \\
+  Affiliation / Address line 3 \\
+  \texttt{email@domain} \\}
+
+%\author{
+%  \textbf{First Author\textsuperscript{1}},
+%  \textbf{Second Author\textsuperscript{1,2}},
+%  \textbf{Third T. Author\textsuperscript{1}},
+%  \textbf{Fourth Author\textsuperscript{1}},
+%\\
+%  \textbf{Fifth Author\textsuperscript{1,2}},
+%  \textbf{Sixth Author\textsuperscript{1}},
+%  \textbf{Seventh Author\textsuperscript{1}},
+%  \textbf{Eighth Author \textsuperscript{1,2,3,4}},
+%\\
+%  \textbf{Ninth Author\textsuperscript{1}},
+%  \textbf{Tenth Author\textsuperscript{1}},
+%  \textbf{Eleventh E. Author\textsuperscript{1,2,3,4,5}},
+%  \textbf{Twelfth Author\textsuperscript{1}},
+%\\
+%  \textbf{Thirteenth Author\textsuperscript{3}},
+%  \textbf{Fourteenth F. Author\textsuperscript{2,4}},
+%  \textbf{Fifteenth Author\textsuperscript{1}},
+%  \textbf{Sixteenth Author\textsuperscript{1}},
+%\\
+%  \textbf{Seventeenth S. Author\textsuperscript{4,5}},
+%  \textbf{Eighteenth Author\textsuperscript{3,4}},
+%  \textbf{Nineteenth N. Author\textsuperscript{2,5}},
+%  \textbf{Twentieth Author\textsuperscript{1}}
+%\\
+%\\
+%  \textsuperscript{1}Affiliation 1,
+%  \textsuperscript{2}Affiliation 2,
+%  \textsuperscript{3}Affiliation 3,
+%  \textsuperscript{4}Affiliation 4,
+%  \textsuperscript{5}Affiliation 5
+%\\
+%  \small{
+%    \textbf{Correspondence:} \href{mailto:email@domain}{email@domain}
+%  }
+%}
+
+\begin{document}
+\maketitle
+\begin{abstract}
+Vision-language-action (VLA) policies suffer from redundant computation across consecutive frames, where large regions of the scene remain static while the model repeatedly re-encodes the entire visual stream. We propose a training-free dual-cache system that reuses computation at both the visual encoder and the language model. Our method identifies static, task-irrelevant patches using a two-stage criterion---temporal appearance consistency and attention-based relevance---and reuses cached representations for those patches while recomputing dynamic or task-relevant regions. The same reuse mask is applied coherently to the Vision Encoder and LLM caches, enabling end-to-end acceleration without modifying the model architecture or requiring finetuning. Experimental results on robotic manipulation tasks show that our method simultaneously improves inference efficiency and task success rates, validating the effectiveness of dual-level cache reuse in achieving both accuracy and efficiency.
+\end{abstract}
+
+\section{Introduction}
+Vision-language-action (VLA) models map visual observations and natural language instructions to low-level control actions, enabling end-to-end robotic manipulation \citep{zitkovich2023rt,octo_2023,kim24openvla,black2024pi_0}. Open-source VLA systems provide strong generalization, yet incur substantial redundant computation at inference time \citep{liu2024robomamba,wen2024tinyvla,DeeR-VLA}. In closed-loop control, consecutive frames are highly redundant: most regions remain static, while only small areas around the end-effector or target objects change. Nevertheless, standard VLA inference recomputes all visual tokens and all decoder states at every step, which is expensive and limits control frequency.
+
+We propose a training-free dual-cache system that jointly reuses caches in the visual encoder and the language model under a single patch-level reuse mask. The mask is derived from a two-stage criterion: pixel-level differences identify static regions, while text-to-vision attention identifies task-critical regions \citep{xu2025vla}. On the vision encoder side, cached attention and MLP outputs are reused for static patches, while dynamic patches are recomputed; a lightweight keyframe refresh prevents error accumulation \citep{liu2025ttf}. On the LLM side, selected regions reuse the previous-frame KV cache so that the prefill stage can avoid full recomputation \citep{xu2025vla}. The same patch mask drives reuse in both modules. This coordinated design enforces consistent visual-language reasoning and improves both success rate and inference speed without modifying model architecture or adding training.
+
+Our contributions are threefold: (1) a dual-cache inference framework that synchronizes reuse decisions across the Vision Encoder and the LLM; (2) a unified, training-free patch selection rule that balances temporal stability and task relevance, with flexible pixel-difference and attention scoring options; and (3) extensive results on multiple benchmarks showing that the method improves efficiency while also increasing task success rates.
+
+\section{Related Work}
+\noindent\textbf{VLA Inference Optimization.}
+Vision-language-action (VLA) models inherit large VLM backbones and benefit from strong multimodal understanding, yet their high inference cost limits real-time control and makes them sensitive to visual noise. Existing optimization methods fall into training-aware and training-free categories. Training-aware methods modify model architectures (e.g., lightweight backbones or specialized action heads) and require retraining to maintain performance \citep{wen2024tinyvla,DeeR-VLA,zhang2025mole,liu2024robomamba}. Training-free methods include: (i) exploiting intra-frame redundancy to prune tokens or layers and accelerate inference \citep{yang2025efficientvla}; (ii) exploiting temporal continuity across frames to reuse caches and accelerate VLA inference \citep{xu2025vla}; and (iii) reusing visual tokens across frames to improve inference success rates \citep{liu2025ttf}. Building on these lines, our method uses a shared patch mask to synchronize reuse decisions in both the vision encoder and the LLM, reusing redundant computation and KV cache across modules to improve both efficiency and success rate.
+
+\noindent\textbf{Token Processing Techniques.}
+Efficient token processing in multimodal Transformers has been widely studied through pruning, merging, and sparse attention \citep{chen2024image,zhang2024sparsevlm,bolya2022token,cao2023pumer,dynamicvit2021,adavit2022,evit2022}. Intra-frame token reduction can lower FLOPs but may degrade spatial fidelity and does not exploit temporal redundancy. In contrast, temporal strategies reuse information across consecutive frames, which is particularly suitable for robotic control where most visual content remains static. Existing methods may target either the visual pathway or the language decoder. Our approach adopts the temporal perspective and implements a dual-cache mechanism: pixel comparison identifies static regions, attention-based filtering preserves task-critical regions, and static, task-irrelevant patches reuse cached computation in both the vision encoder and the LLM.
+
+
+\section{Methodology}
+\subsection{Problem Setting}
+We consider a VLA policy that maps an image $I_t$ and a textual prompt to an action \citep{liu2024robomamba,wen2024tinyvla,DeeR-VLA}. The model consists of a visual encoder (ViT), a projector, and a causal LLM \citep{vaswani2017attention,touvron2023llama,bai2023qwen,team2024gemma}. The ViT partitions the image into $P$ patches and outputs patch embeddings, which are projected and concatenated with text tokens before being processed by the LLM. In closed-loop robot control, consecutive frames are highly redundant; recomputing all patches and decoder states at every step wastes significant computation. Our objective is to leverage temporal redundancy to enable cross-frame reuse of hidden layer representations for repetitive visual content across both the Vision Encoder and the LLM, without requiring any retraining.
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\textwidth]{figures/flowchart.png}
+    \caption{Overview of the proposed training-free dual-cache inference framework \citep{xu2025vla,liu2025ttf}. 
+    Given consecutive observations $I_{t-1}$ and $I_t$, a two-stage patch selection strategy is applied to identify reusable regions. 
+    Stage (1) evaluates temporal consistency using appearance similarity metrics to obtain static patch candidates $\mathcal{S}$. 
+    Stage (2) estimates task relevance from previous-step LLM attention and selects the top-$K$ task-critical patches $\mathcal{A}$ \citep{xu2025vla}. 
+    The final reusable set is computed as $\mathcal{R} = \mathcal{S} \setminus \mathcal{A}$, yielding a patch-level reuse mask $m_t$. 
+    The same mask is shared across the visual encoder and the language model: static, task-irrelevant patches reuse cached attention and MLP outputs in the ViT, while the corresponding visual tokens are pruned during LLM prefill and their cached key/value states are reused. 
+    This coordinated dual-level reuse enables efficient inference without model modification or finetuning, producing the action output $a_t$.}
+    \label{fig:overview}
+\end{figure*}
+
+
+
+\subsection{Dual-Cache Framework}
+We formulate dual-level reuse as a unified temporal caching strategy that couples the visual encoder and the language model through a single patch-level mask \citep{xu2025vla,liu2025ttf}. Let $m_t \in \{0,1\}^P$ denote the reuse mask at time $t$, where $m_t(p)=1$ indicates a patch deemed reusable from the previous frame. The mask is applied consistently at two levels: (i) within the ViT, where static patches reuse cached sublayer outputs and dynamic patches are recomputed, and (ii) within the LLM, where reusable visual token positions are exempted from prefill recomputation and their key/value states are inherited from the previous frame \citep{xu2025vla}. This shared mask enforces cross-module consistency: the same static regions are treated identically by the visual and language components, while dynamic or task-relevant regions are refreshed. The token ordering is preserved, and the model architecture remains unchanged, enabling training-free acceleration without disrupting standard VLA inference. Figure~\ref{fig:overview} summarizes this unified reuse pipeline.
+
+
+\subsection{Two-Stage Patch Selection}
+We determine the reuse mask using a two-stage criterion that combines temporal consistency and task relevance \citep{liu2025ttf,xu2025vla}.
+
+\textbf{Stage 1: Temporal Consistency.} Each image is partitioned into $P$ patches, and we compute a similarity or difference score per patch between $I_{t-1}$ and $I_t$. We support cosine similarity of patch RGB vectors as well as pixel-difference criteria (grayscale or RGB) \citep{liu2025ttf}. A patch is marked static if it exceeds a cosine threshold or falls below a pixel-difference threshold, yielding a static candidate set $\mathcal{S}$.
+
+\textbf{Stage 2: Task Relevance.} We estimate patch relevance using LLM attention from the previous step. Specifically, we aggregate text-to-vision attention and select the top-$K$ patches with highest relevance, denoted $\mathcal{A}$ \citep{xu2025vla}. These patches are treated as task-critical and are always recomputed.
+
+The final reusable set is
+\[
+\mathcal{R} = \mathcal{S} \setminus \mathcal{A},
+\]
+and the reuse mask is $m_t(p)=1$ iff $p \in \mathcal{R}$. Intuitively, $\mathcal{R}$ contains patches that are both temporally stable and weakly related to the current task, making them safe to reuse without harming performance.
+
+\subsection{ViT-Side Reuse}
+The ViT cache stores intermediate outputs of each block. For static patches, we directly reuse the cached attention output and cached MLP output; dynamic patches are computed normally. This yields a simple, training-free mechanism to skip both attention and MLP computation on static regions while preserving the full token sequence \citep{liu2025ttf}.
+
+\textbf{Why not direct KV reuse in ViT?} Cross-frame reuse of K/V is the most direct way to accelerate attention, but ViTs do not expose a native KV cache in standard inference. Implementing KV reuse would require rewriting attention kernels and cache management. We instead reuse the attention and MLP sublayer outputs, which integrates cleanly into existing ViT implementations while still removing the dominant per-layer computation on static patches.
+\textbf{Keyframe refresh.} Because ViT reuse operates on intermediate sublayer outputs, repeated reuse can accumulate feature drift. We therefore adopt a periodic keyframe strategy: every $K$ steps (or at the first frame), all patches are recomputed and the ViT cache is refreshed \citep{liu2025ttf}. Between keyframes, only patches in $\mathcal{R}$ are reused. This explicit reset prevents error accumulation in the visual encoder while retaining most of the computational savings.
+\subsection{LLM-Side Reuse}
+We apply the same patch-level reuse mask to the language side to ensure cross-modal consistency \citep{xu2025vla}. The mask identifies static, task-irrelevant visual token positions, and at selected decoder layers we prune the current prefill sequence to skip recomputation of those positions. The corresponding K/V states are inherited from past\_key\_values, while dynamic and task-relevant tokens are recomputed. This coordinated design keeps the LLM cache aligned with the ViT cache under a shared decision rule, preventing cross-module semantic drift and enabling end-to-end acceleration without altering token order or architecture. To mitigate error accumulation in the LLM, we modulate reuse per layer with attention entropy: layers with more concentrated attention reuse more cached tokens, while layers with diffuse attention recompute more tokens to refresh the cache \citep{xu2025vla}.
+
+\subsection{Training-Free Implementation and Overhead}
+Our method introduces no new parameters and requires no finetuning, similar in spirit to other training-free efficiency strategies \citep{yang2025efficientvla}. It operates purely at inference time through mask construction and cache reuse. The temporal consistency check and attention-based relevance filtering are lightweight compared to full ViT/LLM computation. Because the same reuse mask is applied consistently across ViT and LLM, the method avoids cross-module inconsistencies and improves inference efficiency while maintaining or improving task success rates.
+
+\begin{algorithm}[t]
+\caption{Coordinated Dual-Cache Inference}
+\label{alg:dual_cache}
+\begin{algorithmic}
+\STATE \textbf{Input:} current frame $I_t$, previous frame $I_{t-1}$, previous attention $A_{t-1}$, caches $\mathcal{C}^{\text{ViT}}_{t-1}, \mathcal{C}^{\text{LLM}}_{t-1}$
+\STATE \textbf{Output:} action $a_t$, updated caches $\mathcal{C}^{\text{ViT}}_{t}, \mathcal{C}^{\text{LLM}}_{t}$
+\IF{IsKeyframe($t$)}
+    \STATE $m_t \leftarrow \mathbf{0}$ \COMMENT{disable reuse}
+    \STATE $V_t \leftarrow \text{ViT}(I_t)$
+\ELSE
+    \STATE $V_t \leftarrow \text{ViT}(I_t)$ \COMMENT{for dynamic patches only}
+    \STATE $\mathcal{S} \leftarrow \text{StaticSelect}(I_{t-1}, I_t)$ \COMMENT{temporal consistency}
+    \STATE $\mathcal{A} \leftarrow \text{TopKAttn}(A_{t-1})$ \COMMENT{task relevance}
+    \STATE $\mathcal{R} \leftarrow \mathcal{S} \setminus \mathcal{A}$; build mask $m_t$
+    \FOR{each patch $i$}
+        \IF{$m_t(i)=1$}
+            \STATE reuse ViT cache for patch $i$ from $\mathcal{C}^{\text{ViT}}_{t-1}$
+        \ENDIF
+    \ENDFOR
+\ENDIF
+\STATE apply LLM pruning at selected layers using $\mathcal{R}$; reuse K/V from $\mathcal{C}^{\text{LLM}}_{t-1}$
+\STATE $a_t \leftarrow \text{LLM}(\text{Project}(V_t))$
+\STATE update $\mathcal{C}^{\text{ViT}}_{t}$ and $\mathcal{C}^{\text{LLM}}_{t}$ with recomputed tokens
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Theoretical Complexity}
+We provide a concise complexity account that aligns with the implemented dual-cache reuse and complements prior analyses of temporal reuse in VLAs \citep{xu2025vla,liu2025ttf}. Let $p$ be the number of visual patches, $L_t$ the number of text tokens, $L_v=p$ the number of visual tokens, and $D_v, M_v$ ($D_l, M_l$) the ViT (LLM) hidden size and MLP width.
+
+\textbf{Selection cost.} Temporal selection compares patch appearance between $I_{t-1}$ and $I_t$. With patch size $p_s$ and image size $H\times H$, the number of patches is $p=(H/p_s)^2$, yielding
+\begin{equation}
+    C_{\text{static}} = \mathcal{O}(p p_s^2) = \mathcal{O}(H^2).
+    \label{eq:static_cost}
+\end{equation}
+Task-relevance filtering aggregates text-to-vision attention, with
+\begin{equation}
+    C_{\text{attn}} = \mathcal{O}(L_t L_v D_l).
+    \label{eq:attn_filter}
+\end{equation}
+These overheads are linear in token count and are small relative to Transformer compute.
+
+\textbf{ViT-side savings.} A ViT block has the standard FLOP form
+\begin{equation}
+    C_{\text{ViT}}(p) \approx 4 p D_v^2 + 2 p^2 D_v + 2 p D_v M_v.
+    \label{eq:vit_flops}
+\end{equation}
+If a fraction $\rho_v$ of patches is reusable, the recomputed count is $p'=(1-\rho_v)p$ and $p-p'=\rho_v p$. The per-layer reduction is
+\begin{equation}
+\label{eq:vit_savings}
+\begin{split}
+    \Delta C_{\text{ViT}} &= 4(\rho_v p)D_v^2 + 2\big(1-(1-\rho_v)^2\big)p^2 D_v \\
+    &\quad + 2(\rho_v p)D_v M_v.
+\end{split}
+\end{equation}
+
+\textbf{LLM-side savings.} The LLM processes $L=L_t+L_v$ tokens in prefill. With reuse ratio $\rho_l$, the recomputed length is $L'=L_t+(1-\rho_l)L_v$ and $L-L'=\rho_l L_v$. Using the same FLOP form,
+\begin{equation}
+    C_{\text{LLM}}(L) \approx 4 L D_l^2 + 2 L^2 D_l + 2 L D_l M_l,
+    \label{eq:llm_flops}
+\end{equation}
+we obtain
+\begin{equation}
+\label{eq:llm_savings}
+\begin{split}
+    \Delta C_{\text{LLM}} &= 4(\rho_l L_v)D_l^2 + 2\big(L^2-(L')^2\big)D_l \\
+    &\quad + 2(\rho_l L_v)D_l M_l.
+\end{split}
+\end{equation}
+which can be equivalently written as $2(L+L')(L-L')D_l$ for the quadratic term.
+
+\textbf{Total savings.} Summing across layers and subtracting selection overhead yields
+\begin{equation}
+    \Delta C_{\text{total}} = \sum_l \big(\Delta C_{\text{ViT}} + \Delta C_{\text{LLM}}\big) - (C_{\text{static}} + C_{\text{attn}}).
+    \label{eq:total_savings}
+\end{equation}
+The dominant terms in both $\Delta C_{\text{ViT}}$ and $\Delta C_{\text{LLM}}$ scale quadratically with sequence length, so moderate reuse ratios yield substantial reductions, while the selection overhead remains linear.
+
+\section{Experiments}
+TBD.
+\subsection{Ablations}
+\paragraph{Consistent vs. split masks.} We evaluate whether using a single reuse mask to drive both ViT- and LLM-side caching is necessary for stable performance. In this ablation, we decouple the patch selection thresholds and top-$K$ parameters for ViT and LLM, yielding two different masks. We observe a marked drop in success rate, especially on goal-oriented tasks, suggesting that cross-module inconsistency between visual features and LLM cached positions can introduce semantic mismatch. This supports our design choice of a unified patch mask shared across ViT and LLM.
+
+\begin{table}[t]
+\centering
+\begin{tabular}{lccc}
+\hline
+\textbf{Setting} & \textbf{Success $\uparrow$} & \textbf{Latency $\downarrow$} & \textbf{TFLOPs $\downarrow$} \\
+\hline
+Shared mask (ours) & TBD & TBD & TBD \\
+Split masks (ViT/LLM) & TBD & TBD & TBD \\
+\hline
+\end{tabular}
+\caption{Ablation on using a shared reuse mask versus separate masks for ViT and LLM.}
+\label{tab:ablation_mask}
+\end{table}
+
+\section{Conclusion}
+TBD.
+
+\bibliographystyle{acl_natbib}
+\bibliography{custom}
+
+\end{document}

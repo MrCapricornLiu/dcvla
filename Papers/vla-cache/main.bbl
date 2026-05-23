@@ -1,0 +1,198 @@
+\begin{thebibliography}{10}
+
+\bibitem{kim2020domain}
+Kuno Kim, Yihong Gu, Jiaming Song, Shengjia Zhao, and Stefano Ermon.
+\newblock Domain adaptive imitation learning.
+\newblock In {\em International Conference on Machine Learning}, pages 5286--5295. PMLR, 2020.
+
+\bibitem{choi2024domain}
+Sungho Choi, Seungyul Han, Woojun Kim, Jongseong Chae, Whiyoung Jung, and Youngchul Sung.
+\newblock Domain adaptive imitation learning with visual observation.
+\newblock {\em Advances in Neural Information Processing Systems}, 36, 2024.
+
+\bibitem{bica2021invariant}
+Ioana Bica, Daniel Jarrett, and Mihaela van~der Schaar.
+\newblock Invariant causal imitation learning for generalizable policies.
+\newblock {\em Advances in Neural Information Processing Systems}, 34:3952--3964, 2021.
+
+\bibitem{awadalla2023openflamingo}
+Anas Awadalla, Irena Gao, Josh Gardner, Jack Hessel, Yusuf Hanafy, Wanrong Zhu, Kalyani Marathe, Yonatan Bitton, Samir Gadre, Shiori Sagawa, Jenia Jitsev, Simon Kornblith, Pang~Wei Koh, Gabriel Ilharco, Mitchell Wortsman, and Ludwig Schmidt.
+\newblock Openflamingo: An open-source framework for training large autoregressive vision-language models.
+\newblock {\em arXiv preprint arXiv:2308.01390}, 2023.
+
+\bibitem{liu2024visual}
+Haotian Liu, Chunyuan Li, Qingyang Wu, and Yong~Jae Lee.
+\newblock Visual instruction tuning.
+\newblock {\em Advances in neural information processing systems}, 36, 2024.
+
+\bibitem{o2024open}
+Abby O’Neill, Abdul Rehman, Abhiram Maddukuri, Abhishek Gupta, Abhishek Padalkar, Abraham Lee, Acorn Pooley, Agrim Gupta, Ajay Mandlekar, Ajinkya Jain, et~al.
+\newblock Open x-embodiment: Robotic learning datasets and rt-x models: Open x-embodiment collaboration 0.
+\newblock In {\em 2024 IEEE International Conference on Robotics and Automation (ICRA)}, pages 6892--6903. IEEE, 2024.
+
+\bibitem{fang2024rh20t}
+Hao-Shu Fang, Hongjie Fang, Zhenyu Tang, Jirong Liu, Chenxi Wang, Junbo Wang, Haoyi Zhu, and Cewu Lu.
+\newblock Rh20t: A comprehensive robotic dataset for learning diverse skills in one-shot.
+\newblock In {\em 2024 IEEE International Conference on Robotics and Automation (ICRA)}, pages 653--660. IEEE, 2024.
+
+\bibitem{zitkovich2023rt}
+Brianna Zitkovich, Tianhe Yu, Sichun Xu, Peng Xu, Ted Xiao, Fei Xia, Jialin Wu, Paul Wohlhart, Stefan Welker, Ayzaan Wahid, et~al.
+\newblock Rt-2: Vision-language-action models transfer web knowledge to robotic control.
+\newblock In {\em Conference on Robot Learning}, pages 2165--2183. PMLR, 2023.
+
+\bibitem{octo_2023}
+{Octo Model Team}, Dibya Ghosh, Homer Walke, Karl Pertsch, Kevin Black, Oier Mees, Sudeep Dasari, Joey Hejna, Charles Xu, Jianlan Luo, Tobias Kreiman, {You Liang} Tan, Lawrence~Yunliang Chen, Pannag Sanketi, Quan Vuong, Ted Xiao, Dorsa Sadigh, Chelsea Finn, and Sergey Levine.
+\newblock Octo: An open-source generalist robot policy.
+\newblock In {\em Proceedings of Robotics: Science and Systems}, Delft, Netherlands, 2024.
+
+\bibitem{niu2024llarva}
+Dantong Niu, Yuvan Sharma, Giscard Biamby, Jerome Quenum, Yutong Bai, Baifeng Shi, Trevor Darrell, and Roei Herzig.
+\newblock Llarva: Vision-action instruction tuning enhances robot learning.
+\newblock {\em arXiv preprint arXiv:2406.11815}, 2024.
+
+\bibitem{kim24openvla}
+{Moo Jin} Kim, Karl Pertsch, Siddharth Karamcheti, Ted Xiao, Ashwin Balakrishna, Suraj Nair, Rafael Rafailov, Ethan Foster, Grace Lam, Pannag Sanketi, Quan Vuong, Thomas Kollar, Benjamin Burchfiel, Russ Tedrake, Dorsa Sadigh, Sergey Levine, Percy Liang, and Chelsea Finn.
+\newblock Openvla: An open-source vision-language-action model.
+\newblock {\em arXiv preprint arXiv:2406.09246}, 2024.
+
+\bibitem{wen2024tinyvla}
+Junjie Wen, Yichen Zhu, Jinming Li, Minjie Zhu, Kun Wu, Zhiyuan Xu, Ning Liu, Ran Cheng, Chaomin Shen, Yaxin Peng, et~al.
+\newblock Tinyvla: Towards fast, data-efficient vision-language-action models for robotic manipulation.
+\newblock {\em arXiv preprint arXiv:2409.12514}, 2024.
+
+\bibitem{park2024quantization}
+Seongmin Park, Hyungmin Kim, Wonseok Jeon, Juyoung Yang, Byeongwook Jeon, Yoonseon Oh, and Jungwook Choi.
+\newblock Quantization-aware imitation-learning for resource-efficient robotic control.
+\newblock {\em arXiv preprint arXiv:2412.01034}, 2024.
+
+\bibitem{DeeR-VLA}
+Yang Yue, Yulin Wang, Bingyi Kang, Yizeng Han, Shenzhi Wang, Shiji Song, Jiashi Feng, and Gao Huang.
+\newblock Deer-vla: Dynamic inference of multimodal large language models for efficient robot execution.
+\newblock In {\em The Thirty-eighth Annual Conference on Neural Information Processing Systems}, 2024.
+
+\bibitem{touvron2023llama}
+Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Nikolay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et~al.
+\newblock Llama 2: Open foundation and fine-tuned chat models.
+\newblock {\em arXiv preprint arXiv:2307.09288}, 2023.
+
+\bibitem{team2024gemma}
+Gemma Team, Morgane Riviere, Shreya Pathak, Pier~Giuseppe Sessa, Cassidy Hardin, Surya Bhupatiraju, L{\'e}onard Hussenot, Thomas Mesnard, Bobak Shahriari, Alexandre Ram{\'e}, et~al.
+\newblock Gemma 2: Improving open language models at a practical size.
+\newblock {\em arXiv preprint arXiv:2408.00118}, 2024.
+
+\bibitem{liu2024libero}
+Bo~Liu, Yifeng Zhu, Chongkai Gao, Yihao Feng, Qiang Liu, Yuke Zhu, and Peter Stone.
+\newblock Libero: Benchmarking knowledge transfer for lifelong robot learning.
+\newblock {\em Advances in Neural Information Processing Systems}, 36, 2024.
+
+\bibitem{li2024evaluating}
+Xuanlin Li, Kyle Hsu, Jiayuan Gu, Karl Pertsch, Oier Mees, Homer~Rich Walke, Chuyuan Fu, Ishikaa Lunawat, Isabel Sieh, Sean Kirmani, et~al.
+\newblock Evaluating real-world robot manipulation policies in simulation.
+\newblock {\em arXiv preprint arXiv:2405.05941}, 2024.
+
+\bibitem{li2024cogact}
+Qixiu Li, Yaobo Liang, Zeyu Wang, Lin Luo, Xi~Chen, Mozheng Liao, Fangyun Wei, Yu~Deng, Sicheng Xu, Yizhong Zhang, et~al.
+\newblock Cogact: A foundational vision-language-action model for synergizing cognition and action in robotic manipulation.
+\newblock {\em arXiv preprint arXiv:2411.19650}, 2024.
+
+\bibitem{kim2025fine}
+Moo~Jin Kim, Chelsea Finn, and Percy Liang.
+\newblock Fine-tuning vision-language-action models: Optimizing speed and success.
+\newblock {\em arXiv preprint arXiv:2502.19645}, 2025.
+
+\bibitem{bai2023qwen}
+Jinze Bai, Shuai Bai, Shusheng Yang, Shijie Wang, Sinan Tan, Peng Wang, Junyang Lin, Chang Zhou, and Jingren Zhou.
+\newblock Qwen-vl: A frontier large vision-language model with versatile abilities.
+\newblock {\em arXiv preprint arXiv:2308.12966}, 2023.
+
+\bibitem{li2023vision}
+Xinghang Li, Minghuan Liu, Hanbo Zhang, Cunjun Yu, Jie Xu, Hongtao Wu, Chilam Cheang, Ya~Jing, Weinan Zhang, Huaping Liu, et~al.
+\newblock Vision-language foundation models as effective robot imitators.
+\newblock {\em arXiv preprint arXiv:2311.01378}, 2023.
+
+\bibitem{chi2023diffusion}
+Cheng Chi, Zhenjia Xu, Siyuan Feng, Eric Cousineau, Yilun Du, Benjamin Burchfiel, Russ Tedrake, and Shuran Song.
+\newblock Diffusion policy: Visuomotor policy learning via action diffusion.
+\newblock {\em The International Journal of Robotics Research}, page 02783649241273668, 2023.
+
+\bibitem{black2024pi_0}
+Kevin Black, Noah Brown, Danny Driess, Adnan Esmail, Michael Equi, Chelsea Finn, Niccolo Fusai, Lachy Groom, Karol Hausman, Brian Ichter, et~al.
+\newblock $\pi_0 $: A vision-language-action flow model for general robot control.
+\newblock {\em arXiv preprint arXiv:2410.24164}, 2024.
+
+\bibitem{huang2024rekep}
+Wenlong Huang, Chen Wang, Yunzhu Li, Ruohan Zhang, and Li~Fei-Fei.
+\newblock Rekep: Spatio-temporal reasoning of relational keypoint constraints for robotic manipulation.
+\newblock {\em arXiv preprint arXiv:2409.01652}, 2024.
+
+\bibitem{zhao2023learning}
+Tony~Z Zhao, Vikash Kumar, Sergey Levine, and Chelsea Finn.
+\newblock Learning fine-grained bimanual manipulation with low-cost hardware.
+\newblock {\em arXiv preprint arXiv:2304.13705}, 2023.
+
+\bibitem{10.1145/3664647.3680838}
+JingJing Xie, Yuxin Zhang, Mingbao Lin, Liujuan Cao, and Rongrong Ji.
+\newblock Advancing multimodal large language models with quantization-aware scale learning for efficient adaptation.
+\newblock In {\em Proceedings of the 32nd ACM International Conference on Multimedia}, MM '24, page 10582–10591, New York, NY, USA, 2024. Association for Computing Machinery.
+
+\bibitem{lin2024mope}
+Haokun Lin, Haoli Bai, Zhili Liu, Lu~Hou, Muyi Sun, Linqi Song, Ying Wei, and Zhenan Sun.
+\newblock Mope-clip: Structured pruning for efficient vision-language models with module-wise pruning error metric.
+\newblock In {\em Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition}, pages 27370--27380, 2024.
+
+\bibitem{chen2025image}
+Liang Chen, Haozhe Zhao, Tianyu Liu, Shuai Bai, Junyang Lin, Chang Zhou, and Baobao Chang.
+\newblock An image is worth 1/2 tokens after layer 2: Plug-and-play inference acceleration for large vision-language models.
+\newblock In {\em European Conference on Computer Vision}, pages 19--35. Springer, 2025.
+
+\bibitem{zhang2024sparsevlm}
+Yuan Zhang, Chun-Kai Fan, Junpeng Ma, Wenzhao Zheng, Tao Huang, Kuan Cheng, Denis Gudovskiy, Tomoyuki Okuno, Yohei Nakata, Kurt Keutzer, et~al.
+\newblock Sparsevlm: Visual token sparsification for efficient vision-language model inference.
+\newblock {\em arXiv preprint arXiv:2410.04417}, 2024.
+
+\bibitem{bolya2022token}
+Daniel Bolya, Cheng-Yang Fu, Xiaoliang Dai, Peizhao Zhang, Christoph Feichtenhofer, and Judy Hoffman.
+\newblock Token merging: Your vit but faster.
+\newblock {\em arXiv preprint arXiv:2210.09461}, 2022.
+
+\bibitem{cao2023pumer}
+Qingqing Cao, Bhargavi Paranjape, and Hannaneh Hajishirzi.
+\newblock Pumer: Pruning and merging tokens for efficient vision language models.
+\newblock {\em arXiv preprint arXiv:2305.17530}, 2023.
+
+\bibitem{cao2024madtp}
+Jianjian Cao, Peng Ye, Shengze Li, Chong Yu, Yansong Tang, Jiwen Lu, and Tao Chen.
+\newblock Madtp: Multimodal alignment-guided dynamic token pruning for accelerating vision-language transformer.
+\newblock In {\em Proceedings of the IEEE/CVF conference on computer vision and pattern recognition}, pages 15710--15719, 2024.
+
+\bibitem{liu2024robomamba}
+Jiaming Liu, Mengzhen Liu, Zhenyu Wang, Lily Lee, Kaichen Zhou, Pengju An, Senqiao Yang, Renrui Zhang, Yandong Guo, and Shanghang Zhang.
+\newblock Robomamba: Multimodal state space model for efficient robot reasoning and manipulation.
+\newblock {\em arXiv preprint arXiv:2406.04339}, 2024.
+
+\bibitem{pertsch2025fast}
+Karl Pertsch, Kyle Stachowicz, Brian Ichter, Danny Driess, Suraj Nair, Quan Vuong, Oier Mees, Chelsea Finn, and Sergey Levine.
+\newblock Fast: Efficient action tokenization for vision-language-action models.
+\newblock {\em arXiv preprint arXiv:2501.09747}, 2025.
+
+\bibitem{zhang2024hirt}
+Jianke Zhang, Yanjiang Guo, Xiaoyu Chen, Yen-Jen Wang, Yucheng Hu, Chengming Shi, and Jianyu Chen.
+\newblock Hirt: Enhancing robotic control with hierarchical robot transformers.
+\newblock {\em arXiv preprint arXiv:2410.05273}, 2024.
+
+\bibitem{vaswani2017attention}
+A~Vaswani.
+\newblock Attention is all you need.
+\newblock {\em Advances in Neural Information Processing Systems}, 2017.
+
+\bibitem{hu2021lora}
+Edward~J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu~Wang, and Weizhu Chen.
+\newblock Lora: Low-rank adaptation of large language models.
+\newblock {\em arXiv preprint arXiv:2106.09685}, 2021.
+
+\bibitem{xiong2024efficient}
+Yunyang Xiong, Chong Zhou, Xiaoyu Xiang, Lemeng Wu, Chenchen Zhu, Zechun Liu, Saksham Suri, Balakrishnan Varadarajan, Ramya Akula, Forrest Iandola, et~al.
+\newblock Efficient track anything.
+\newblock {\em arXiv preprint arXiv:2411.18933}, 2024.
+
+\end{thebibliography}
