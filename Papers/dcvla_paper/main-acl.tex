@@ -140,7 +140,8 @@ where $\mathrm{KV}_t^{\text{new}}(p)$ denotes the key/value states computed at t
 Unlike prior approaches that apply reuse independently within the language model, the reuse set $\mathcal{R}_t$ here is determined jointly with the vision encoder, ensuring that both modules operate on an aligned set of visual tokens.
 
 Operationally, the visual token positions in $\mathcal{R}_t$ are omitted from prefill recomputation at selected decoder layers and directly inherit cached K/V states from the previous timestep.
-Dynamic or task-relevant visual tokens remain in the prefill sequence and update the cache as usual. Reuse can be applied at a fixed subset of decoder layers (e.g., every $r$ layers), and the reuse ratio may be modulated by attention entropy; we find our method to be insensitive to the exact choice of $r$ within a reasonable range.
+Dynamic or task-relevant visual tokens remain in the prefill sequence and update the cache as usual.
+Reuse is applied using a fixed decoder-layer schedule, and the reuse ratio can be modulated by attention entropy following the VLA-Cache-style component used in our implementation.
 
 The reuse mask is applied only to visual token positions; text tokens are always recomputed.
 Token order and sequence layout are preserved, enabling a drop-in implementation compatible with standard autoregressive decoding.
@@ -159,6 +160,7 @@ This synchronization is critical for preserving visual--language alignment acros
 
 \IF{IsKeyframe($t$)}
     \STATE $m_t \leftarrow \mathbf{0}$ \COMMENT{disable reuse}
+    \STATE $\mathcal{R}_t \leftarrow \emptyset$; $\mathcal{C}_t \leftarrow \{1,\ldots,P\}$
     \STATE $V_t \leftarrow \text{VisionEncoder}(I_t)$
 \ELSE
     \STATE $\mathcal{S}_t \leftarrow \text{StaticSelect}(I_{t-1}, I_t)$ \COMMENT{temporal consistency}
@@ -166,12 +168,7 @@ This synchronization is critical for preserving visual--language alignment acros
     \STATE $\mathcal{A}_{t-1} \leftarrow \text{TopKAttn}(A_{t-1})$ \COMMENT{task relevance}
     \STATE $\mathcal{C}_t \leftarrow \mathcal{D}_t \cup \mathcal{A}_{t-1}$ \COMMENT{recompute set}
     \STATE $\mathcal{R}_t \leftarrow \mathcal{C}_t^{c}$; build unified mask $m_t$
-    \STATE $V_t \leftarrow \text{VisionEncoder}(I_t)$ \COMMENT{reuse or recompute per $m_t$}
-    \FOR{each patch $p$}
-        \IF{$m_t(i)=1$}
-            \STATE reuse vision-encoder cache for patch $p$ from $\mathcal{C}^{\text{VE}}_{t-1}$
-        \ENDIF
-    \ENDFOR
+    \STATE $V_t \leftarrow \text{VisionEncoder}(I_t; m_t, \mathcal{C}^{\text{VE}}_{t-1})$ \COMMENT{reuse or recompute per $m_t$}
 \ENDIF
 
 \STATE skip LLM prefill recomputation for $\mathcal{R}_t$; reuse cached K/V from $\mathcal{C}^{\text{LLM}}_{t-1}$
@@ -192,9 +189,9 @@ Temporal consistency checking compares patch appearance between $I_{t-1}$ and $I
     C_{\text{static}} = \mathcal{O}(p p_s^2) = \mathcal{O}(H^2).
     \label{eq:static_cost}
 \end{equation}
-Task relevance estimation aggregates text-to-vision attention, with cost
+Task relevance estimation aggregates text-to-vision attention from the previous step, with cost
 \begin{equation}
-    C_{\text{attn}} = \mathcal{O}(L_t L_v D_l).
+    C_{\text{attn}} = \mathcal{O}(L_t L_v).
     \label{eq:attn_filter}
 \end{equation}
 Both costs scale linearly with token count and are negligible compared to Transformer attention.
@@ -445,12 +442,12 @@ VE mask low & 74.0 & 70.0 & 79.0 & 40.0 & 65.8 \\
 
 \subsubsection{Switch Ablation: Vision-Side vs.\ LLM-Side Reuse}
 
-To isolate the contributions of vision-encoder-side reuse and language-model-side reuse, we conduct a switch ablation study on OpenVLA, reported in Table~\ref{tab:ablation_switch}. We independently enable or disable reuse in the vision encoder (ViT) and the language model (VLA cache), resulting in four configurations. The LLM-only configuration $(\cmark,\xmark)$ is a VLA-Cache-style baseline, since it reuses cached LLM key--value states without coordinating the decision with vision-encoder reuse.
+To isolate the contributions of vision-encoder-side reuse and language-model-side reuse, we conduct a switch ablation study on OpenVLA, reported in Table~\ref{tab:ablation_switch}. We independently enable or disable reuse in the vision encoder (ViT) and the language model (LLM cache), resulting in four configurations. The LLM-only configuration $(\cmark,\xmark)$ is a VLA-Cache-style baseline, since it reuses cached LLM key--value states without coordinating the decision with vision-encoder reuse.
 
 
 
 \paragraph{Independent Effects.}
-Enabling reuse only on the language-model side, corresponding to the VLA-Cache-style setting, reduces LLM latency and TFLOPs while slightly improving success rates, confirming prior findings that reusing cached key--value states is effective for VLA inference. Enabling reuse only on the vision side reduces ViT latency and TFLOPs and yields moderate performance gains, indicating that reusing static visual patches does not harm—and can even help—policy execution.
+Enabling reuse only on the language-model side, corresponding to the VLA-Cache-style setting, reduces LLM latency and TFLOPs while slightly improving success rates, confirming prior findings that reusing cached key--value states is effective for VLA inference. Enabling reuse only on the vision side generally reduces measured ViT latency and yields moderate performance gains, indicating that reusing static visual patches does not harm—and can even help—policy execution.
 
 \paragraph{Coordinated Reuse.}
 The full CTR configuration, where both reuse mechanisms are enabled and driven by a unified mask, consistently outperforms either single-sided variant, including the VLA-Cache-style LLM-only baseline. This indicates that coordinating reuse across modalities provides benefits beyond applying temporal cache reuse only in the LLM and helps preserve visual--language alignment.

@@ -25,8 +25,8 @@ These configurations are kept identical across baselines and CTR-enabled variant
 
 \subsection{CTR Configuration and Latency Accounting}
 Unless otherwise specified, CTR uses grayscale patch difference for temporal consistency, a difference threshold of $0.004$, top-$K$ task-relevance selection with $K=160$, and a keyframe interval of $5$ control steps.
-Patch-level attention scores are computed from the previous-step text-to-vision attention: attention maps are averaged over heads, text-query positions are averaged over the vision-token columns, and the top-$K$ visual patches are marked task-relevant and forced to recompute.
-The LLM-side layer schedule follows the entropy-based cache-reuse schedule used by the VLA-cache component.
+Patch-level attention scores are computed from the previous-step text-to-vision attention: attention maps are averaged over heads, then the text-query rows are averaged for each vision-token column, and the top-$K$ visual patches are marked task-relevant and forced to recompute.
+The LLM-side layer schedule follows the entropy-based cache-reuse schedule used by the VLA-Cache component.
 
 OpenVLA-style models use two vision-encoder branches, DINOv2 and SigLIP.
 Accordingly, main-table model-core latency and TFLOPs are computed as
@@ -35,6 +35,22 @@ Accordingly, main-table model-core latency and TFLOPs are computed as
 \]
 When a component ablation reports a single VE latency or TFLOPs value, it is reported per vision branch; this is why the main-table totals correspond to $2\times$VE + LLM in the OpenVLA ablation.
 All reported efficiency numbers exclude simulator stepping, rendering, and robot actuation.
+
+\subsection{Implementation Details}
+CTR is implemented as an inference-time cache mechanism and does not change the checkpoint weights, tokenizer, image processor, or action head.
+At timestep $t=0$ and at every keyframe, all visual patches are recomputed and both VE and LLM caches are refreshed.
+For non-keyframe steps, the same patch-level mask is applied to both branches of the vision encoder and to the corresponding visual-token positions in the LLM prefill.
+Text tokens are always recomputed; reuse decisions are applied only to visual tokens.
+
+The text-to-vision attention signal is extracted from the previous dense or CTR forward pass.
+We aggregate attention by averaging over heads and over text-query positions, yielding one scalar relevance score per visual patch.
+The top-$K$ visual patches under this relevance score are treated as task-relevant and are excluded from reuse even when their pixel difference is small.
+This previous-step attention is deliberately used as a conservative signal: it avoids requiring an additional current-frame LLM pass solely for mask construction.
+
+For latency measurement, CUDA events are placed around the model-core components.
+The reported VE latency is the average latency of one vision branch, while the main OpenVLA total uses both DINOv2 and SigLIP branches.
+The reported LLM latency includes multimodal prefill and action-token decoding inside the language model, but excludes simulator stepping, rendering, image acquisition, and robot actuation.
+The TFLOPs estimates count arithmetic operations in the dense or reuse-enabled model-core path and do not count Python dispatch or cache bookkeeping as FLOPs; these engineering costs are instead reflected in measured CUDA latency.
 
 \subsection{Benchmarks}
 We evaluate CTR on two complementary simulation benchmarks that cover a wide spectrum of manipulation behaviors.
@@ -56,6 +72,116 @@ We evaluate two VLA backbones: OpenVLA and OpenVLA-OFT.
 All experiments use officially released OpenVLA-7B checkpoints.
 CTR is applied strictly at inference time and does not modify model weights, training data, or optimization procedures.
 Both the baseline and CTR-enabled models share identical architectures and token layouts.
+
+\subsection{Detailed Dataflow of Vision-Encoder Reuse}
+CTR preserves the original visual token layout while reducing the amount of current-frame computation inside the vision encoder.
+Let $P$ denote the full number of visual patches and let $D_t$ denote the patches that are either temporally dynamic or task-relevant at timestep $t$.
+For each transformer block, only tokens in $D_t$ issue current-frame queries and pass through the block MLP; the remaining tokens reuse cached sublayer states from the previous timestep.
+The dynamic key/value states are written back to the per-block cache, and the block output is scattered back to the original $P$-token order.
+Thus, the downstream projector and LLM receive the same full-length visual sequence as in the dense model.
+
+\begin{table}[h]
+\centering
+\small
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Token group} & \textbf{Q source} & \textbf{K/V source} & \textbf{MLP} & \textbf{Output} \\
+\midrule
+Recompute $D_t$ & current & current/cache update & current & fresh \\
+Reuse $P\setminus D_t$ & none & cache & skipped & cached \\
+\bottomrule
+\end{tabular}
+}
+\caption{Vision-encoder dataflow under CTR. Reused tokens do not issue current-frame queries and do not run the block MLP, but the full token order is restored after each block.}
+\label{tab:appendix_ve_dataflow}
+\end{table}
+
+This implementation differs from physically shortening the visual grid.
+Dense ViT attention uses a $P\times P$ query--key interaction.
+CTR changes the dominant attention interaction to $D_t\times P$: dynamic/task-relevant queries attend to the full cached context, while reused tokens do not issue queries.
+This design keeps the representation shape compatible with the original OpenVLA pipeline and avoids retraining or changing the projector/LLM input contract.
+
+\subsection{Expanded Complexity Accounting}
+The main text gives the compact complexity equations.
+Here we spell out which computation each term corresponds to.
+For a ViT block with hidden size $d_v$ and MLP width $m_v$, dense inference over $P$ visual patches has three dominant components:
+\begin{equation}
+    C_{\mathrm{VE}}^{\mathrm{dense}}
+    \approx 4P d_v^2 + 2P^2 d_v + 2P d_v m_v.
+\end{equation}
+The first term approximates Q/K/V and output projections, the second term approximates attention score and value aggregation, and the third term approximates the two-layer MLP.
+If CTR recomputes only $D_t$ patches, the corresponding current-frame compute becomes
+\begin{equation}
+    C_{\mathrm{VE}}^{\mathrm{CTR}}
+    \approx 4D_t d_v^2 + 2D_tP d_v + 2D_t d_v m_v + C_{\mathrm{cache}},
+\end{equation}
+where $C_{\mathrm{cache}}$ denotes cache read/write and scatter overhead.
+The attention term is $D_tP$, not $D_t^2$, because recomputed query tokens still attend to the full cached visual context.
+This is the intended tradeoff: CTR keeps the original full-token interface while reducing query-side attention, projection, and MLP computation.
+
+For the LLM, let $L_x$ be the number of text/action-prompt tokens, $P$ the number of visual tokens, and $D_t$ the number of visual tokens that remain in the recompute set at reuse-enabled decoder layers.
+The dense multimodal prefill length is $L=L_x+P$, while the recomputed length under reuse is $L'=L_x+D_t$.
+For a decoder block with hidden size $d_l$ and MLP width $m_l$, the idealized dense and reuse-enabled prefill costs are
+\begin{align}
+    C_{\mathrm{LLM}}^{\mathrm{dense}} &\approx 4L d_l^2 + 2L^2 d_l + 2L d_l m_l, \\
+    C_{\mathrm{LLM}}^{\mathrm{CTR}} &\approx 4L' d_l^2 + 2(L')^2 d_l + 2L' d_l m_l + C_{\mathrm{merge}}.
+\end{align}
+$C_{\mathrm{merge}}$ captures cache merging and indexing overhead and is not counted as arithmetic FLOPs.
+This distinction is why TFLOPs reduction and wall-clock latency reduction need not be identical.
+The complexity analysis measures the arithmetic avoided by not recomputing selected visual-token K/V states, while the latency tables report the actual CUDA time including cache-management overhead.
+
+\subsection{Causal Dependency of LLM-Side Cache Reuse}
+A natural concern is whether LLM-side KV reuse is compatible with causal attention.
+If one requires exact equivalence to a dense causal transformer for an arbitrary new input, then non-prefix KV reuse is not algebraically exact: the hidden state of a later token can depend on earlier tokens, so changing an early token may affect all later K/V representations.
+CTR therefore does not claim exact dense equivalence for arbitrary token changes.
+Instead, it uses KV reuse as a controlled temporal approximation for closed-loop VLA inference.
+
+The approximation is constrained in three ways.
+First, the reused positions are selected from patches that are visually stable between consecutive frames.
+Second, visual patches that receive high previous-step text-to-vision attention are always recomputed, even if their pixels appear stable.
+Third, periodic keyframes force a full refresh, limiting long-term error accumulation.
+In other words, CTR reuses cached K/V only for positions that are both temporally stable and low in task relevance, while dynamic or instruction-critical patches are recomputed.
+
+This also explains why the same mask is useful across the VE and LLM.
+The VE-side reuse reduces current-frame visual computation while keeping the full visual sequence layout.
+The LLM-side reuse then applies the same patch decision to the multimodal prefill cache, so the language model does not recompute K/V for visual tokens that the vision encoder has already treated as stable.
+
+\paragraph{Error intuition.}
+For an attention output $o_i=\sum_j \alpha_{ij} V_j$, reusing the cached value at position $j$ contributes an error proportional to both its attention mass $\alpha_{ij}$ and its cross-frame value drift.
+The CTR mask is designed to reduce both factors: temporal filtering selects patches with small representation drift, and text-to-vision attention filtering removes high-mass task-relevant patches from the reuse set.
+This does not make reuse exact, but it makes the approximation aligned with the error terms that matter most for the next action prediction.
+
+\subsection{Lightweight Probe of LLM Cache-Reuse Assumptions}
+To check whether the mask behaves as intended, we run a lightweight diagnostic on the OpenVLA LIBERO-Spatial checkpoint.
+The probe uses ten synthetic consecutive frame pairs and performs dense forward passes for both frames.
+For each pair, we build the CTR reuse mask using the same grayscale-difference threshold ($0.004$), static top-$K$ ($160$), and attention top-$K$ ($160$) as in the main configuration.
+We then compare dense cross-frame K/V drift and previous-step text-to-vision attention mass for tokens selected for reuse versus recomputation.
+K/V drift is measured as the average RMS change of dense decoder K/V states across layers and heads.
+We also report a simple attention-weighted drift proxy, computed as $\mathrm{KV\ drift}\times\mathrm{Attn.\ mean}$, to reflect that the effect of a reused value on the attention output is modulated by its attention mass.
+This probe is not intended as a new benchmark; it only tests whether the mask selects tokens that are less sensitive under dense computation.
+
+\begin{table}[h]
+\centering
+\small
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Group} & \textbf{\# Tok.} & \textbf{KV drift} & \textbf{K drift} & \textbf{V drift} & \textbf{Attn. mean} & \textbf{Proxy} \\
+\midrule
+Reuse-selected & 55.4 & 0.305 & 0.379 & 0.231 & 0.000104 & $3.18{\times}10^{-5}$ \\
+Recompute-selected & 200.6 & 0.450 & 0.553 & 0.347 & 0.000870 & $3.92{\times}10^{-4}$ \\
+\bottomrule
+\end{tabular}
+}
+\caption{Diagnostic comparison between tokens selected for reuse and tokens selected for recomputation. Reuse-selected tokens show moderately lower dense cross-frame K/V drift and much lower text-to-vision attention mass; the attention-weighted drift proxy is therefore substantially smaller.}
+\label{tab:appendix_llm_cache_probe}
+\end{table}
+
+The reuse-selected tokens have $67.8\%$ of the K/V drift of the recompute-selected tokens and only $12.0\%$ of their mean text-to-vision attention mass.
+Therefore, their attention-weighted drift proxy is only about $8.1\%$ of that of the recompute-selected tokens.
+These results support the intended behavior of the CTR mask: it preferentially assigns low-drift, low-attention visual tokens to the cache-reuse path, while preserving recomputation for tokens more likely to affect the action.
+They also clarify the scope of the method: LLM cache reuse is a temporally guided approximation for VLA control rather than a theorem of exact equivalence under arbitrary causal-token changes.
 
 
 \subsection{Qualitative Visualization of an Inference Trajectory}
