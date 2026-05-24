@@ -23,6 +23,19 @@ visual patches per frame.
 We evaluate two widely used vision backbones in OpenVLA-style models: DINOv2 and SigLIP.
 These configurations are kept identical across baselines and CTR-enabled variants to isolate the effect of coordinated token reuse.
 
+\subsection{CTR Configuration and Latency Accounting}
+Unless otherwise specified, CTR uses grayscale patch difference for temporal consistency, a difference threshold of $0.004$, top-$K$ task-relevance selection with $K=160$, and a keyframe interval of $5$ control steps.
+Patch-level attention scores are computed from the previous-step text-to-vision attention: attention maps are averaged over heads, text-query positions are averaged over the vision-token columns, and the top-$K$ visual patches are marked task-relevant and forced to recompute.
+The LLM-side layer schedule follows the entropy-based cache-reuse schedule used by the VLA-cache component.
+
+OpenVLA-style models use two vision-encoder branches, DINOv2 and SigLIP.
+Accordingly, main-table model-core latency and TFLOPs are computed as
+\[
+    \mathrm{Total} = \mathrm{VE}_{\mathrm{DINOv2}} + \mathrm{VE}_{\mathrm{SigLIP}} + \mathrm{LLM}.
+\]
+When a component ablation reports a single VE latency or TFLOPs value, it is reported per vision branch; this is why the main-table totals correspond to $2\times$VE + LLM in the OpenVLA ablation.
+All reported efficiency numbers exclude simulator stepping, rendering, and robot actuation.
+
 \subsection{Benchmarks}
 We evaluate CTR on two complementary simulation benchmarks that cover a wide spectrum of manipulation behaviors.
 
