@@ -121,13 +121,15 @@ The attention term is $D_tP$, not $D_t^2$, because recomputed query tokens still
 This is the intended tradeoff: CTR keeps the original full-token interface while reducing query-side attention, projection, and MLP computation.
 
 For the LLM, let $L_x$ be the number of text/action-prompt tokens, $P$ the number of visual tokens, and $D_t$ the number of visual tokens that remain in the recompute set at reuse-enabled decoder layers.
-The dense multimodal prefill length is $L=L_x+P$, while the recomputed length under reuse is $L'=L_x+D_t$.
-For a decoder block with hidden size $d_l$ and MLP width $m_l$, the idealized dense and reuse-enabled prefill costs are
+The dense multimodal prefill length is $L=L_x+P$, while the recomputed query length under reuse is $L'=L_x+D_t$.
+The reused visual tokens retain cached K/V states, so recomputed tokens still attend to the cached full visual context.
+For a decoder block with hidden size $d_l$ and gated MLP width $m_l$, the idealized dense and reuse-enabled prefill costs are
 \begin{align}
-    C_{\mathrm{LLM}}^{\mathrm{dense}} &\approx 4L d_l^2 + 2L^2 d_l + 2L d_l m_l, \\
-    C_{\mathrm{LLM}}^{\mathrm{CTR}} &\approx 4L' d_l^2 + 2(L')^2 d_l + 2L' d_l m_l + C_{\mathrm{merge}}.
+    C_{\mathrm{LLM}}^{\mathrm{dense}} &\approx 4L d_l^2 + 2L^2 d_l + 3L d_l m_l, \\
+    C_{\mathrm{LLM}}^{\mathrm{CTR}} &\approx 4L' d_l^2 + 2L' L d_l + 3L' d_l m_l + C_{\mathrm{merge}}.
 \end{align}
 $C_{\mathrm{merge}}$ captures cache merging and indexing overhead and is not counted as arithmetic FLOPs.
+The attention term is $L' L$, not $(L')^2$, because CTR reuses cached visual K/V states rather than physically removing them from the context.
 This distinction is why TFLOPs reduction and wall-clock latency reduction need not be identical.
 The complexity analysis measures the arithmetic avoided by not recomputing selected visual-token K/V states, while the latency tables report the actual CUDA time including cache-management overhead.
 

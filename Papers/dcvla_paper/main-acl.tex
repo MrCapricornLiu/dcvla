@@ -213,9 +213,11 @@ where the quadratic term arises from self-attention. CTR preserves the full outp
 reflecting skipped projections, query-side attention interactions, and MLP computation for reusable static patches. The estimate does not assume physical removal of visual tokens: after each block, recomputed outputs are scattered back into the full token grid, preserving the interface expected by the projector and LLM.
 
 \paragraph{Language-model-side savings.}
-The language model processes $L=L_t+L_v$ tokens during the prefill stage. With reuse ratio $\rho_l$, the effective recomputed prefill length at reuse-enabled layers becomes $L' = L_t + (1-\rho_l)L_v$. Using the standard Transformer cost
+The language model processes $L=L_t+L_v$ tokens during the prefill stage. With reuse ratio $\rho_l$, the effective recomputed prefill query length at reuse-enabled layers becomes $L' = L_t + (1-\rho_l)L_v$.
+Cached K/V states for reusable visual tokens remain available as attention context, so the attention score computation changes from $L\times L$ to $L' \times L$ rather than to a physically shortened $L' \times L'$ sequence.
+Using the decoder-block cost
 \begin{equation}
-    C_{\text{LLM}}(L) \approx 4 L D_l^2 + 2 L^2 D_l + 2 L D_l M_l,
+    C_{\text{LLM}}(L) \approx 4 L D_l^2 + 2 L^2 D_l + 3 L D_l M_l,
     \label{eq:llm_flops}
 \end{equation}
 the saved computation per layer is
@@ -223,11 +225,11 @@ the saved computation per layer is
 \label{eq:llm_savings}
 \begin{split}
     \Delta C_{\text{LLM}} &= 4(\rho_l L_v)D_l^2
-    + 2\big(L^2 - (L')^2\big)D_l \\
-    &\quad + 2(\rho_l L_v)D_l M_l.
+    + 2\big(L^2 - L' L\big)D_l \\
+    &\quad + 3(\rho_l L_v)D_l M_l.
 \end{split}
 \end{equation}
-The quadratic term can be equivalently written as $2(L+L')(L-L')D_l$.
+The attention term can be equivalently written as $2L(L-L')D_l$.
 
 \paragraph{Total savings.}
 Summing across layers and subtracting selection overhead yields
